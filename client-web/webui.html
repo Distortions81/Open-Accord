@@ -81,7 +81,13 @@
     .id-copy-wrap:hover .copy-tip { opacity:1; }
     .friend-head { display:flex; align-items:center; justify-content:space-between; gap:8px; min-width:0; }
     .friend-head > .linkish { min-width:0; flex:1; overflow-wrap:anywhere; word-break:break-word; }
+    .friend-name-wrap { display:flex; align-items:center; gap:6px; min-width:0; flex:1; }
     .friend-controls { display:inline-flex; align-items:center; gap:6px; }
+    .unread-badge {
+      display:inline-flex; align-items:center; justify-content:center;
+      min-width:16px; height:16px; padding:0 5px; border-radius:999px;
+      background:#ce3348; color:#fff; font-size:11px; font-weight:700; line-height:1;
+    }
     .pending-head { margin-top:8px; padding-top:8px; border-top:1px solid #223040; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
     .pending-row { padding:6px 4px; border-bottom:1px solid #223040; }
     .pending-actions { display:flex; gap:6px; margin-top:4px; }
@@ -281,9 +287,13 @@ let activeGroup = '';
 let activeChannel = 'default';
 let latestGroups = [];
 let latestTargets = [];
+let latestPendingFriends = [];
 let inviteGroup = '';
 let inviteChannel = '';
 let persistContextTimer = null;
+let selfLoginID = '';
+let chatEvents = [];
+let unreadDM = {};
 
 function updateChatContext() {
   mainWrap.classList.remove('mode-dm', 'mode-group');
@@ -300,6 +310,7 @@ function updateChatContext() {
     const label = (t && t.label) ? t.label : activeTarget;
     chatTitle.textContent = `${label} direct message`;
   }
+  renderChat();
 }
 
 function appendInfo(line) {
@@ -309,32 +320,76 @@ function appendInfo(line) {
   infoEl.scrollTop = infoEl.scrollHeight;
 }
 
-function appendChat(ev) {
-  const row = document.createElement('div');
-  row.className = 'chat-row';
-  const ts = document.createElement('span');
-  ts.className = 'chat-ts';
-  ts.textContent = ev.ts || '';
-  const name = document.createElement('span');
-  name.className = 'chat-name';
-  name.textContent = ev.actor_label || 'unknown';
-  if (ev.actor_id) {
-    name.title = 'View profile';
-    name.onclick = () => openProfileCard(ev.actor_id);
-  } else {
-    name.className = '';
+function eventMatchesActiveContext(ev) {
+  if (!ev || ev.kind !== 'chat') return false;
+  const mode = (ev.mode || '').trim();
+  if (activeGroup) {
+    const ch = (ev.channel || 'default').trim() || 'default';
+    return mode === 'group' && (ev.group || '') === activeGroup && ch === activeChannel;
   }
-  const msg = document.createElement('span');
-  msg.className = 'chat-text';
-  msg.textContent = ev.text || '';
-  row.appendChild(ts);
-  row.appendChild(name);
-  row.appendChild(msg);
-  chatEl.appendChild(row);
+  if (activeTarget) {
+    return mode === 'dm' && (ev.target || '') === activeTarget;
+  }
+  return false;
+}
+
+function renderChat() {
+  chatEl.innerHTML = '';
+  const visible = chatEvents.filter(eventMatchesActiveContext);
+  for (const ev of visible) {
+    const row = document.createElement('div');
+    row.className = 'chat-row';
+    const ts = document.createElement('span');
+    ts.className = 'chat-ts';
+    ts.textContent = ev.ts || '';
+    const name = document.createElement('span');
+    name.className = 'chat-name';
+    name.textContent = ev.actor_label || 'unknown';
+    if (ev.actor_id) {
+      name.title = 'View profile';
+      name.onclick = () => openProfileCard(ev.actor_id);
+    } else {
+      name.className = '';
+    }
+    const msg = document.createElement('span');
+    msg.className = 'chat-text';
+    msg.textContent = ev.text || '';
+    row.appendChild(ts);
+    row.appendChild(name);
+    row.appendChild(msg);
+    chatEl.appendChild(row);
+  }
   while (chatEl.childElementCount > 500) {
     chatEl.removeChild(chatEl.firstChild);
   }
   chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function appendChat(ev) {
+  chatEvents.push(ev);
+  if (chatEvents.length > 1000) chatEvents = chatEvents.slice(chatEvents.length - 1000);
+  const isDM = (ev.mode || '').trim() === 'dm';
+  const target = (ev.target || '').trim();
+  if (isDM && target && target !== activeTarget && ev.actor_id !== selfLoginID) {
+    unreadDM[target] = (unreadDM[target] || 0) + 1;
+    renderTargets(latestTargets, latestPendingFriends);
+  }
+  if (eventMatchesActiveContext(ev)) {
+    renderChat();
+  }
+}
+
+function clearUnreadDM(target) {
+  target = (target || '').trim();
+  if (!target) return;
+  if (unreadDM[target]) delete unreadDM[target];
+}
+
+function createUnreadBadge(count) {
+  const b = document.createElement('span');
+  b.className = 'unread-badge';
+  b.textContent = count > 99 ? '99+' : String(count);
+  return b;
 }
 
 function currentTarget() {
@@ -457,6 +512,7 @@ async function openProfileCard(loginID) {
 
 function renderTargets(targets, pendingFriends) {
   latestTargets = Array.isArray(targets) ? targets : [];
+  latestPendingFriends = Array.isArray(pendingFriends) ? pendingFriends : [];
   let changed = false;
   if (!activeGroup && activeTarget) {
     const found = latestTargets.some((t) => (t.id || '') === activeTarget);
@@ -476,9 +532,11 @@ function renderTargets(targets, pendingFriends) {
     row.style.cursor = 'pointer';
     if (activeTarget === t.id && !activeGroup) row.classList.add('sel-row-dm');
     row.onclick = () => {
+      clearUnreadDM(t.id);
       activeTarget = t.id;
       activeGroup = '';
       activeChannel = 'default';
+      renderTargets(latestTargets, latestPendingFriends);
       updateChatContext();
       persistContextSoon();
     };
@@ -490,6 +548,13 @@ function renderTargets(targets, pendingFriends) {
     name.style.flex = '1';
     name.style.overflowWrap = 'anywhere';
     name.style.wordBreak = 'break-word';
+    const nameWrap = document.createElement('div');
+    nameWrap.className = 'friend-name-wrap';
+    nameWrap.appendChild(name);
+    const unread = Number(unreadDM[t.id] || 0);
+    if (unread > 0) {
+      nameWrap.appendChild(createUnreadBadge(unread));
+    }
     const status = document.createElement('span');
     const state = (t.online === 'online') ? 'online' : 'offline';
     status.textContent = state;
@@ -511,13 +576,13 @@ function renderTargets(targets, pendingFriends) {
     controls.appendChild(createCopyIDControl(t.id));
     const head = document.createElement('div');
     head.className = 'friend-head';
-    head.appendChild(name);
+    head.appendChild(nameWrap);
     head.appendChild(controls);
 
     row.appendChild(head);
     friendList.appendChild(row);
   }
-  const pending = pendingFriends || [];
+  const pending = latestPendingFriends;
   if (pending.length > 0) {
     const header = document.createElement('div');
     header.className = 'pending-head';
@@ -720,6 +785,7 @@ function renderChannels() {
 async function bootstrap() {
   const res = await fetch('/api/bootstrap');
   const data = await res.json();
+  selfLoginID = (data.login_id || '').trim();
   friendsUserName.textContent = data.display_name || '(no nickname)';
   profileIDCopy.innerHTML = '';
   profileIDCopy.appendChild(createCopyIDControl(data.login_id || ''));

@@ -156,6 +156,10 @@ type webEvent struct {
 	TS         string `json:"ts"`
 	ActorID    string `json:"actor_id,omitempty"`
 	ActorLabel string `json:"actor_label,omitempty"`
+	Mode       string `json:"mode,omitempty"`    // dm|group
+	Target     string `json:"target,omitempty"`  // dm target
+	Group      string `json:"group,omitempty"`   // group context
+	Channel    string `json:"channel,omitempty"` // channel context
 }
 
 type dmTarget struct {
@@ -247,6 +251,39 @@ func (c *webClient) addEventWithActor(kind string, text string, actorID string) 
 		actorLabel = c.displayPeerLocked(actorID)
 	}
 	c.events = append(c.events, webEvent{Seq: c.nextSeq, Kind: kind, Text: text, TS: stamp(), ActorID: strings.TrimSpace(actorID), ActorLabel: actorLabel})
+	if len(c.events) > 1000 {
+		c.events = c.events[len(c.events)-1000:]
+	}
+}
+
+func (c *webClient) addChatEventWithActor(text string, actorID string, mode string, target string, group string, channel string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextSeq++
+	actorLabel := ""
+	if strings.TrimSpace(actorID) != "" {
+		actorLabel = c.displayPeerLocked(actorID)
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != "dm" && mode != "group" {
+		mode = ""
+	}
+	e := webEvent{
+		Seq:        c.nextSeq,
+		Kind:       "chat",
+		Text:       text,
+		TS:         stamp(),
+		ActorID:    strings.TrimSpace(actorID),
+		ActorLabel: actorLabel,
+		Mode:       mode,
+		Target:     strings.TrimSpace(target),
+		Group:      strings.TrimSpace(group),
+		Channel:    strings.TrimSpace(channel),
+	}
+	if e.Mode == "group" && e.Channel == "" {
+		e.Channel = "default"
+	}
+	c.events = append(c.events, e)
 	if len(c.events) > 1000 {
 		c.events = c.events[len(c.events)-1000:]
 	}
@@ -541,8 +578,14 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			line := p.Body
 			if strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" {
 				c.rememberGroup(p.Group, p.Channel)
+				c.addChatEventWithActor(line, p.From, "group", "", p.Group, p.Channel)
+			} else {
+				target := strings.TrimSpace(p.From)
+				if strings.TrimSpace(p.From) == c.loginID {
+					target = strings.TrimSpace(p.To)
+				}
+				c.addChatEventWithActor(line, p.From, "dm", target, "", "")
 			}
-			c.addEventWithActor("chat", line, p.From)
 			if meta := messageMeta(p); meta != "" {
 				c.addEvent("info", fmt.Sprintf("msg from=%s %s", c.displayPeer(p.From), meta))
 			}
@@ -980,7 +1023,7 @@ func (c *webClient) handleSend(w http.ResponseWriter, r *http.Request) {
 	if c.displayPeer(target) == shortID(target) {
 		c.requestProfile(target)
 	}
-	c.addEventWithActor("chat", text, c.loginID)
+	c.addChatEventWithActor(text, c.loginID, "dm", target, "", "")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

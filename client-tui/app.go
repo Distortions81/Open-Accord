@@ -459,7 +459,13 @@ func (m *model) shouldShow(e uiEntry) bool {
 	case panelChannel:
 		return e.channel == m.focusChannel
 	default:
-		return true
+		if strings.TrimSpace(m.group) != "" && strings.TrimSpace(m.channel) != "" {
+			return e.channel == strings.TrimSpace(m.group)+"/"+strings.TrimSpace(m.channel)
+		}
+		if strings.TrimSpace(m.to) != "" {
+			return e.direct == strings.TrimSpace(m.to)
+		}
+		return false
 	}
 }
 
@@ -914,12 +920,24 @@ func (m model) View() string {
 		m.input.Width = maxInt(10, m.width-4)
 	}
 
-	chatTitle := "all messages"
-	switch {
-	case strings.TrimSpace(m.group) != "" && strings.TrimSpace(m.channel) != "":
-		chatTitle = fmt.Sprintf("%s/%s", strings.TrimSpace(m.group), strings.TrimSpace(m.channel))
-	case strings.TrimSpace(m.to) != "":
-		chatTitle = fmt.Sprintf("%s direct message", m.displayPeer(m.to))
+	chatTitle := "select dm or server/channel"
+	switch m.focusMode {
+	case panelChannel:
+		if strings.TrimSpace(m.focusChannel) != "" {
+			chatTitle = strings.TrimSpace(m.focusChannel)
+			break
+		}
+		fallthrough
+	case panelAll:
+		if strings.TrimSpace(m.group) != "" && strings.TrimSpace(m.channel) != "" {
+			chatTitle = fmt.Sprintf("%s/%s", strings.TrimSpace(m.group), strings.TrimSpace(m.channel))
+		} else if strings.TrimSpace(m.to) != "" {
+			chatTitle = fmt.Sprintf("%s direct message", m.displayPeer(m.to))
+		}
+	case panelDirect:
+		if strings.TrimSpace(m.focusDirect) != "" {
+			chatTitle = fmt.Sprintf("%s direct message", m.displayPeer(m.focusDirect))
+		}
 	}
 
 	visible := make([]string, 0, len(m.chatEntries))
