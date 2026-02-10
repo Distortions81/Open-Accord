@@ -94,6 +94,7 @@ Common fields:
 - `error`
 - `getaddr`
 - `addr`
+- `presence_get` (user -> server, unsigned convenience query)
 
 ### Signed action packets (must include `id,from,pub_key,sig`)
 - `send`
@@ -108,6 +109,7 @@ Common fields:
 ### Server-generated notifications
 - `deliver`
 - `channel_deliver`
+- `presence_data`
 - `friend_request`
 - `friend_update`
 - `channel_update`
@@ -118,6 +120,11 @@ Common fields:
 ### `send`
 - Required: `to`, `body`
 - Behavior: direct user-to-user delivery (`deliver`).
+
+### `presence_get`
+- Required: `to`
+- Behavior: asks local server for current connection status of `to`.
+- Response: requester receives `presence_data(from=to, body=online|offline)`.
 
 ### Friend model
 - `friend_add`:

@@ -27,6 +27,25 @@
     .profile-card { position:fixed; right:20px; top:20px; width:320px; z-index:1000; box-shadow:0 10px 28px rgba(0,0,0,.5); }
     .profile-card .small { margin-bottom:6px; }
     .muted { color:var(--muted); }
+    .id-copy-wrap { display:inline-flex; position:relative; align-items:center; }
+    .copy-id-btn {
+      width:auto; min-width:0; margin:0; padding:4px 6px; border-radius:6px;
+      border:1px solid #33404d; background:#111820; color:#8ecbff; cursor:pointer;
+      display:inline-flex; align-items:center; justify-content:center;
+    }
+    .copy-id-btn svg { width:14px; height:14px; fill:currentColor; }
+    .copy-tip {
+      position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%);
+      background:#111820; border:1px solid #33404d; border-radius:4px; padding:2px 6px;
+      color:var(--text); font-size:11px; white-space:nowrap; opacity:0; pointer-events:none;
+      transition:opacity .12s ease;
+    }
+    .id-copy-wrap:hover .copy-tip { opacity:1; }
+    .friend-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .status-chip { font-size:11px; border:1px solid #33404d; border-radius:999px; padding:1px 8px; text-transform:lowercase; }
+    .status-online { color:#59d185; border-color:#2b6e45; background:#10281a; }
+    .status-offline { color:#c9a37f; border-color:#5a4430; background:#241a12; }
+    .status-unknown { color:#9aa6b2; border-color:#33404d; background:#141b22; }
     @media (max-width: 900px) {
       .wrap { grid-template-columns: 1fr; }
       .profile-card { left:12px; right:12px; top:12px; width:auto; }
@@ -45,6 +64,7 @@
       <button id="friendAdd">Friend Add</button>
       <button id="friendAccept">Friend Accept</button>
     </div>
+    <button id="checkOnline">Check Online</button>
 
     <details style="margin-top:10px;">
       <summary>Targets</summary>
@@ -174,6 +194,53 @@ function relativeTime(unixSec) {
   return `${days}d ago`;
 }
 
+function createCopyIDControl(loginID) {
+  const wrap = document.createElement('span');
+  wrap.className = 'id-copy-wrap';
+  const tip = document.createElement('span');
+  tip.className = 'copy-tip';
+  tip.textContent = 'copyid';
+  const btn = document.createElement('button');
+  btn.className = 'copy-id-btn';
+  btn.type = 'button';
+  btn.setAttribute('aria-label', 'copyid');
+  btn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 1H6a2 2 0 0 0-2 2v12h2V3h10V1zm3 4H10a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H10V7h9v14z"/></svg>';
+  let resetTimer = null;
+  btn.onmouseenter = () => { tip.textContent = 'copyid'; };
+  btn.onclick = async () => {
+    if (!loginID) return;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(loginID);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = loginID;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      tip.textContent = 'copied!';
+      if (resetTimer) clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => { tip.textContent = 'copyid'; }, 1200);
+    } catch (_) {
+      tip.textContent = 'copyid';
+    }
+  };
+  wrap.appendChild(btn);
+  wrap.appendChild(tip);
+  return wrap;
+}
+
+function statusClass(status) {
+  if (status === 'online') return 'status-chip status-online';
+  if (status === 'offline') return 'status-chip status-offline';
+  return 'status-chip status-unknown';
+}
+
 async function openProfileCard(loginID) {
   if (!loginID) return;
   try {
@@ -182,7 +249,8 @@ async function openProfileCard(loginID) {
     if (!res.ok) throw new Error(data.error || ('http ' + res.status));
     const p = data.profile || {};
     cardNickname.textContent = p.nickname || p.label || '(unknown)';
-    cardID.textContent = p.id || loginID;
+    cardID.innerHTML = '';
+    cardID.appendChild(createCopyIDControl(p.id || loginID));
     cardProfile.textContent = p.profile_text || '(empty)';
     cardRefreshed.textContent = relativeTime(p.last_refreshed || 0);
     profileCard.hidden = false;
@@ -198,7 +266,7 @@ function renderTargets(targets) {
   for (const t of targets || []) {
     const o = document.createElement('option');
     o.value = t.id;
-    o.textContent = `${t.label} (${t.id.slice(0,12)})`;
+    o.textContent = t.label;
     targetSelect.appendChild(o);
 
     const row = document.createElement('div');
@@ -213,18 +281,19 @@ function renderTargets(targets) {
     name.className = 'linkish';
     name.title = 'View profile';
     name.onclick = () => openProfileCard(t.id);
+    const status = document.createElement('span');
+    status.textContent = t.online || 'unknown';
+    status.className = statusClass(t.online);
+    const head = document.createElement('div');
+    head.className = 'friend-head';
+    head.appendChild(name);
+    head.appendChild(status);
 
     const id = document.createElement('div');
-    id.textContent = t.id;
-    id.className = 'linkish';
-    id.title = 'Click to select this user id';
-    id.onclick = () => {
-      targetInput.value = t.id;
-      targetInput.focus();
-      targetInput.select();
-    };
+    id.style.marginTop = '4px';
+    id.appendChild(createCopyIDControl(t.id));
 
-    row.appendChild(name);
+    row.appendChild(head);
     row.appendChild(id);
     friendList.appendChild(row);
   }
@@ -243,21 +312,17 @@ async function bootstrap() {
   n.textContent = data.display_name || '(no nickname)';
   n.style.fontWeight = '700';
   const id = document.createElement('div');
-  id.textContent = data.login_id || '';
-  id.className = 'linkish';
-  id.title = 'Click to select your login id';
-  id.onclick = () => {
-    targetInput.value = data.login_id || '';
-    targetInput.focus();
-    targetInput.select();
-  };
+  id.style.marginTop = '4px';
+  id.appendChild(createCopyIDControl(data.login_id || ''));
   session.appendChild(n);
   session.appendChild(id);
   document.getElementById('displayName').value = data.display_name || '';
   document.getElementById('profileText').value = data.profile_text || '';
   renderTargets(data.targets || []);
+  await post('/api/presence/check', {});
 }
 
+let lastPresenceCheckAt = 0;
 async function poll() {
   try {
     const res = await fetch('/api/events?since=' + since);
@@ -268,6 +333,11 @@ async function poll() {
       else appendInfo(`${ev.ts} ${ev.text}`);
     }
     if (data.targets) renderTargets(data.targets);
+    const now = Date.now();
+    if (now - lastPresenceCheckAt > 15000) {
+      lastPresenceCheckAt = now;
+      await post('/api/presence/check', {});
+    }
   } catch (e) {
     appendInfo(`poll error: ${e.message}`);
   }
@@ -315,6 +385,13 @@ document.getElementById('refreshTargets').onclick = async () => {
     const data = await res.json();
     renderTargets(data.targets || []);
   } catch (e) { appendInfo(`refresh failed: ${e.message}`); }
+};
+
+document.getElementById('checkOnline').onclick = async () => {
+  try {
+    await post('/api/presence/check', {});
+    lastPresenceCheckAt = Date.now();
+  } catch (e) { appendInfo(`presence check failed: ${e.message}`); }
 };
 </script>
 </body>

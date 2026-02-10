@@ -1056,6 +1056,16 @@ func (s *Server) sendToUser(to string, p Packet) bool {
 	return delivered
 }
 
+func (s *Server) isUserOnline(loginID string) bool {
+	loginID = strings.TrimSpace(loginID)
+	if loginID == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.users[loginID]) > 0
+}
+
 func isSignedActionType(typ string) bool {
 	switch typ {
 	case "send", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get":
@@ -1320,6 +1330,25 @@ func (s *Server) handleProfileGet(p Packet) {
 	s.notifyUserOrQueue(out)
 }
 
+func (s *Server) handlePresenceGet(requester string, target string) {
+	requester = strings.TrimSpace(requester)
+	target = strings.TrimSpace(target)
+	if requester == "" || target == "" {
+		return
+	}
+	state := "offline"
+	if s.isUserOnline(target) {
+		state = "online"
+	}
+	_ = s.sendToUser(requester, Packet{
+		Type:   "presence_data",
+		From:   target,
+		To:     requester,
+		Body:   state,
+		Origin: s.id,
+	})
+}
+
 func encodeBodyForRelay(body string) (string, string, int, error) {
 	if len(body) < 64 {
 		return body, compressionNone, 0, nil
@@ -1546,6 +1575,10 @@ func (s *Server) handleUser(loginID string, c *Conn, reader *bufio.Reader, rl *r
 }
 
 func (s *Server) handleUserPacket(sender string, p Packet) {
+	if p.Type == "presence_get" {
+		s.handlePresenceGet(sender, p.To)
+		return
+	}
 	if !isSignedActionType(p.Type) {
 		return
 	}

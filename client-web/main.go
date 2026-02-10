@@ -128,6 +128,7 @@ type dmTarget struct {
 	Nickname      string `json:"nickname,omitempty"`
 	ProfileText   string `json:"profile_text,omitempty"`
 	LastRefreshed int64  `json:"last_refreshed,omitempty"`
+	Online        string `json:"online,omitempty"`
 }
 
 type webClient struct {
@@ -148,6 +149,7 @@ type webClient struct {
 	nicknames         map[string]string
 	peerProfiles      map[string]string
 	profileRefreshed  map[string]int64
+	presence          map[string]string
 	friends           map[string]struct{}
 	lastFriendRequest string
 
@@ -269,6 +271,32 @@ func (c *webClient) requestProfile(target string) {
 	_ = c.sendSigned(Packet{Type: "profile_get", To: target})
 }
 
+func (c *webClient) requestPresence(target string) {
+	target = strings.TrimSpace(target)
+	if !looksLikeLoginID(target) || target == c.loginID {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = c.enc.Encode(Packet{Type: "presence_get", To: target})
+}
+
+func (c *webClient) setPresence(loginID string, state string) {
+	loginID = strings.TrimSpace(loginID)
+	state = strings.ToLower(strings.TrimSpace(state))
+	if !looksLikeLoginID(loginID) {
+		return
+	}
+	switch state {
+	case "online", "offline":
+	default:
+		state = "unknown"
+	}
+	c.mu.Lock()
+	c.presence[loginID] = state
+	c.mu.Unlock()
+}
+
 func (c *webClient) publishOwnProfile() error {
 	c.mu.Lock()
 	payload := profilePayload{Nickname: c.displayName, ProfileText: c.profileText}
@@ -384,6 +412,8 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				line += " bio=" + text
 			}
 			c.addEvent("info", line)
+		case "presence_data":
+			c.setPresence(p.From, p.Body)
 		case "error":
 			c.addEvent("info", "server error: "+p.Body)
 		default:
@@ -440,7 +470,14 @@ func (c *webClient) dmTargets() []dmTarget {
 	})
 	out := make([]dmTarget, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, dmTarget{ID: id, Label: c.displayPeerLocked(id), Nickname: strings.TrimSpace(c.nicknames[id]), ProfileText: strings.TrimSpace(c.peerProfiles[id]), LastRefreshed: c.profileRefreshed[id]})
+		out = append(out, dmTarget{
+			ID:            id,
+			Label:         c.displayPeerLocked(id),
+			Nickname:      strings.TrimSpace(c.nicknames[id]),
+			ProfileText:   strings.TrimSpace(c.peerProfiles[id]),
+			LastRefreshed: c.profileRefreshed[id],
+			Online:        strings.TrimSpace(c.presence[id]),
+		})
 	}
 	return out
 }
@@ -449,7 +486,14 @@ func (c *webClient) profileCard(loginID string) dmTarget {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	loginID = strings.TrimSpace(loginID)
-	return dmTarget{ID: loginID, Label: c.displayPeerLocked(loginID), Nickname: strings.TrimSpace(c.nicknames[loginID]), ProfileText: strings.TrimSpace(c.peerProfiles[loginID]), LastRefreshed: c.profileRefreshed[loginID]}
+	return dmTarget{
+		ID:            loginID,
+		Label:         c.displayPeerLocked(loginID),
+		Nickname:      strings.TrimSpace(c.nicknames[loginID]),
+		ProfileText:   strings.TrimSpace(c.peerProfiles[loginID]),
+		LastRefreshed: c.profileRefreshed[loginID],
+		Online:        strings.TrimSpace(c.presence[loginID]),
+	}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -636,6 +680,33 @@ func (c *webClient) handleProfileGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.requestProfile(target)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (c *webClient) handlePresenceCheck(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		To string `json:"to"`
+	}
+	if r.ContentLength > 0 {
+		if err := decodeJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+	}
+	if strings.TrimSpace(req.To) != "" {
+		target, ok := c.resolveRecipient(req.To)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown recipient"})
+			return
+		}
+		c.requestPresence(target)
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	targets := c.dmTargets()
+	for _, t := range targets {
+		c.requestPresence(t.ID)
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1287,20 +1358,21 @@ func main() {
 	}
 
 	client := &webClient{
-		enc:          enc,
-		conn:         conn,
-		priv:         priv,
-		pubB64:       pubB64,
-		loginID:      loginID,
-		displayName:  displayName,
-		profileText:  profileText,
-		contactsPath: *contactsPath,
-		profilePath:  *profilePath,
-		contacts:     contacts,
-		nicknames:    nicknames,
-		peerProfiles: peerProfiles,
+		enc:              enc,
+		conn:             conn,
+		priv:             priv,
+		pubB64:           pubB64,
+		loginID:          loginID,
+		displayName:      displayName,
+		profileText:      profileText,
+		contactsPath:     *contactsPath,
+		profilePath:      *profilePath,
+		contacts:         contacts,
+		nicknames:        nicknames,
+		peerProfiles:     peerProfiles,
 		profileRefreshed: profileRefreshed,
-		friends:      make(map[string]struct{}),
+		presence:         make(map[string]string),
+		friends:          make(map[string]struct{}),
 	}
 	client.addEvent("info", "connected to "+*serverAddr)
 	client.addEvent("info", "login_id: "+loginID)
@@ -1331,6 +1403,7 @@ func main() {
 	mux.HandleFunc("/api/friend/accept", client.handleFriendAccept)
 	mux.HandleFunc("/api/profile/set", client.handleProfileSet)
 	mux.HandleFunc("/api/profile/get", client.handleProfileGet)
+	mux.HandleFunc("/api/presence/check", client.handlePresenceCheck)
 	mux.HandleFunc("/api/profile/card", client.handleProfileCard)
 
 	ln, err := net.Listen("tcp", *webAddr)
