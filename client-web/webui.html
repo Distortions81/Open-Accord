@@ -85,8 +85,8 @@
     .friend-controls { display:inline-flex; align-items:center; gap:6px; }
     .unread-badge {
       display:inline-flex; align-items:center; justify-content:center;
-      min-width:16px; height:16px; padding:0 5px; border-radius:999px;
-      background:#ce3348; color:#fff; font-size:11px; font-weight:700; line-height:1;
+      width:18px; height:18px; border-radius:50%;
+      background:#d92b45; color:#fff; font-size:11px; font-weight:700; line-height:1;
     }
     .pending-head { margin-top:8px; padding-top:8px; border-top:1px solid #223040; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
     .pending-row { padding:6px 4px; border-bottom:1px solid #223040; }
@@ -294,6 +294,7 @@ let persistContextTimer = null;
 let selfLoginID = '';
 let chatEvents = [];
 let unreadDM = {};
+let unreadGroupChannel = {};
 
 function updateChatContext() {
   mainWrap.classList.remove('mode-dm', 'mode-group');
@@ -369,10 +370,21 @@ function appendChat(ev) {
   chatEvents.push(ev);
   if (chatEvents.length > 1000) chatEvents = chatEvents.slice(chatEvents.length - 1000);
   const isDM = (ev.mode || '').trim() === 'dm';
+  const isGroup = (ev.mode || '').trim() === 'group';
   const target = (ev.target || '').trim();
+  const group = (ev.group || '').trim();
+  const channel = ((ev.channel || 'default').trim() || 'default');
   if (isDM && target && target !== activeTarget && ev.actor_id !== selfLoginID) {
     unreadDM[target] = (unreadDM[target] || 0) + 1;
     renderTargets(latestTargets, latestPendingFriends);
+  }
+  if (isGroup && group && ev.actor_id !== selfLoginID) {
+    const isActiveThread = !!activeGroup && activeGroup === group && (activeChannel || 'default') === channel;
+    if (!isActiveThread) {
+      const key = group + '/' + channel;
+      unreadGroupChannel[key] = (unreadGroupChannel[key] || 0) + 1;
+      renderGroups(latestGroups);
+    }
   }
   if (eventMatchesActiveContext(ev)) {
     renderChat();
@@ -388,8 +400,27 @@ function clearUnreadDM(target) {
 function createUnreadBadge(count) {
   const b = document.createElement('span');
   b.className = 'unread-badge';
-  b.textContent = count > 99 ? '99+' : String(count);
+  b.textContent = count > 9 ? '9+' : String(count);
   return b;
+}
+
+function clearUnreadGroupChannel(group, channel) {
+  group = (group || '').trim();
+  channel = ((channel || 'default').trim() || 'default');
+  if (!group) return;
+  const key = group + '/' + channel;
+  if (unreadGroupChannel[key]) delete unreadGroupChannel[key];
+}
+
+function unreadCountForGroup(group) {
+  group = (group || '').trim();
+  if (!group) return 0;
+  const prefix = group + '/';
+  let total = 0;
+  for (const [k, n] of Object.entries(unreadGroupChannel)) {
+    if (k.startsWith(prefix)) total += Number(n || 0);
+  }
+  return total;
 }
 
 function currentTarget() {
@@ -703,6 +734,7 @@ function renderGroups(groups) {
     row.onclick = () => {
       activeGroup = g.name || '';
       activeChannel = 'default';
+      clearUnreadGroupChannel(activeGroup, activeChannel);
       activeTarget = '';
       renderGroups(latestGroups);
       renderChannels();
@@ -713,6 +745,10 @@ function renderGroups(groups) {
     name.className = 'group-name';
     name.textContent = g.name || '(group)';
     row.appendChild(name);
+    const gUnread = unreadCountForGroup(g.name || '');
+    if (gUnread > 0) {
+      row.appendChild(createUnreadBadge(gUnread));
+    }
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'row-icon-btn';
@@ -760,7 +796,9 @@ function renderChannels() {
     if (activeChannel === ch) row.classList.add('sel-row-channel');
     row.onclick = () => {
       activeChannel = ch;
+      clearUnreadGroupChannel(activeGroup, activeChannel);
       renderChannels();
+      renderGroups(latestGroups);
       updateChatContext();
       persistContextSoon();
     };
@@ -768,6 +806,10 @@ function renderChannels() {
     name.className = 'group-name';
     name.textContent = ch;
     row.appendChild(name);
+    const cUnread = Number(unreadGroupChannel[(activeGroup || '') + '/' + ch] || 0);
+    if (cUnread > 0) {
+      row.appendChild(createUnreadBadge(cUnread));
+    }
     const invite = document.createElement('button');
     invite.type = 'button';
     invite.className = 'row-icon-btn';
