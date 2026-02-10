@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,6 +22,26 @@ type testClient struct {
 	counter uint64
 }
 
+type testServerConfig struct {
+	maxMessageBytes int
+	maxMsgsPerSec   int
+	burstMessages   int
+	maxSeenEntries  int
+	maxKnownAddrs   int
+	knownAddrTTL    time.Duration
+}
+
+func defaultTestServerConfig() testServerConfig {
+	return testServerConfig{
+		maxMessageBytes: defaultMaxMessageBytes,
+		maxMsgsPerSec:   defaultMaxMsgsPerSec,
+		burstMessages:   defaultBurstMessages,
+		maxSeenEntries:  defaultMaxSeenEntries,
+		maxKnownAddrs:   defaultMaxKnownAddrs,
+		knownAddrTTL:    defaultKnownAddrTTL,
+	}
+}
+
 func signTestMessage(priv ed25519.PrivateKey, id, from, to, body string) (string, error) {
 	msg, err := json.Marshal(signedAction{Type: "send", ID: id, From: from, To: to, Body: body})
 	if err != nil {
@@ -30,7 +51,7 @@ func signTestMessage(priv ed25519.PrivateKey, id, from, to, body string) (string
 	return base64.StdEncoding.EncodeToString(sig), nil
 }
 
-func startTestServer(t *testing.T, localSID, advertise string, seedAddrs []string) (string, *Server, func()) {
+func startTestServer(t *testing.T, localSID, advertise string, seedAddrs []string, cfg testServerConfig) (string, *Server, func()) {
 	t.Helper()
 
 	ownerPub, ownerPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -43,7 +64,19 @@ func startTestServer(t *testing.T, localSID, advertise string, seedAddrs []strin
 		t.Fatalf("composeServerID failed: %v", err)
 	}
 
-	s := NewServer(id, base64.StdEncoding.EncodeToString(ownerPub), ownerPriv, advertise, 16)
+	s := NewServer(
+		id,
+		base64.StdEncoding.EncodeToString(ownerPub),
+		ownerPriv,
+		advertise,
+		16,
+		cfg.maxMessageBytes,
+		cfg.maxMsgsPerSec,
+		cfg.burstMessages,
+		cfg.maxSeenEntries,
+		cfg.maxKnownAddrs,
+		cfg.knownAddrTTL,
+	)
 	for _, seed := range seedAddrs {
 		s.addKnownAddr(seed)
 	}
@@ -92,13 +125,7 @@ func newTestClient(t *testing.T, addr string) *testClient {
 		t.Fatalf("dial failed: %v", err)
 	}
 
-	c := &testClient{
-		conn:   conn,
-		enc:    json.NewEncoder(conn),
-		dec:    json.NewDecoder(conn),
-		priv:   priv,
-		pubB64: pubB64,
-	}
+	c := &testClient{conn: conn, enc: json.NewEncoder(conn), dec: json.NewDecoder(conn), priv: priv, pubB64: pubB64}
 
 	if err := c.enc.Encode(Packet{Type: "hello", Role: "user", PubKey: pubB64}); err != nil {
 		t.Fatalf("hello send failed: %v", err)
@@ -135,48 +162,96 @@ func newTestClient(t *testing.T, addr string) *testClient {
 	return c
 }
 
+func loginWithKey(t *testing.T, addr string, priv ed25519.PrivateKey) (Packet, error) {
+	t.Helper()
+
+	pub := priv.Public().(ed25519.PublicKey)
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		return Packet{}, err
+	}
+	defer conn.Close()
+
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
+
+	if err := enc.Encode(Packet{Type: "hello", Role: "user", PubKey: pubB64}); err != nil {
+		return Packet{}, err
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	var challenge Packet
+	if err := dec.Decode(&challenge); err != nil {
+		return Packet{}, err
+	}
+	if challenge.Type != "challenge" {
+		return challenge, nil
+	}
+
+	loginSig := ed25519.Sign(priv, []byte("login:"+challenge.Nonce))
+	if err := enc.Encode(Packet{Type: "auth", PubKey: pubB64, Sig: base64.StdEncoding.EncodeToString(loginSig)}); err != nil {
+		return Packet{}, err
+	}
+
+	var resp Packet
+	err = dec.Decode(&resp)
+	return resp, err
+}
+
+func waitForPeerCount(t *testing.T, s *Server, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		got := len(s.peers)
+		s.mu.RUnlock()
+		if got >= want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("peer count did not reach %d", want)
+}
+
 func (c *testClient) close() {
 	_ = c.conn.Close()
 }
 
 func (c *testClient) send(t *testing.T, to, body string) {
 	t.Helper()
-
 	c.counter++
 	id := fmt.Sprintf("test-%d", c.counter)
 	sig, err := signTestMessage(c.priv, id, c.loginID, to, body)
 	if err != nil {
 		t.Fatalf("sign failed: %v", err)
 	}
-
-	if err := c.enc.Encode(Packet{
-		Type:   "send",
-		ID:     id,
-		From:   c.loginID,
-		To:     to,
-		Body:   body,
-		PubKey: c.pubB64,
-		Sig:    sig,
-	}); err != nil {
+	if err := c.enc.Encode(Packet{Type: "send", ID: id, From: c.loginID, To: to, Body: body, PubKey: c.pubB64, Sig: sig}); err != nil {
 		t.Fatalf("send failed: %v", err)
 	}
 }
 
 func (c *testClient) recv(t *testing.T, timeout time.Duration) Packet {
 	t.Helper()
-
-	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
-	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
-
-	var p Packet
-	if err := c.dec.Decode(&p); err != nil {
+	p, err := c.recvMaybe(timeout)
+	if err != nil {
 		t.Fatalf("recv failed: %v", err)
 	}
 	return p
 }
 
+func (c *testClient) recvMaybe(timeout time.Duration) (Packet, error) {
+	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
+	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
+	var p Packet
+	err := c.dec.Decode(&p)
+	return p, err
+}
+
 func TestMessageDeliveryBetweenClients(t *testing.T) {
-	addr, _, stop := startTestServer(t, "s1", "", nil)
+	cfg := defaultTestServerConfig()
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
 	defer stop()
 
 	alice := newTestClient(t, addr)
@@ -191,21 +266,16 @@ func TestMessageDeliveryBetweenClients(t *testing.T) {
 	if p.Type != "deliver" {
 		t.Fatalf("expected deliver, got: %+v", p)
 	}
-	if p.From != alice.loginID {
-		t.Fatalf("unexpected from: got=%s want=%s", p.From, alice.loginID)
-	}
-	if p.To != bob.loginID {
-		t.Fatalf("unexpected to: got=%s want=%s", p.To, bob.loginID)
-	}
-	if p.Body != body {
-		t.Fatalf("unexpected body: got=%q want=%q", p.Body, body)
+	if p.From != alice.loginID || p.To != bob.loginID || p.Body != body {
+		t.Fatalf("unexpected payload: %+v", p)
 	}
 }
 
 func TestMessageRelayAcrossPeers(t *testing.T) {
-	addrA, srvA, stopA := startTestServer(t, "s1", "", nil)
+	cfg := defaultTestServerConfig()
+	addrA, srvA, stopA := startTestServer(t, "s1", "", nil, cfg)
 	defer stopA()
-	addrB, _, stopB := startTestServer(t, "s1", "", []string{addrA})
+	addrB, _, stopB := startTestServer(t, "s1", "", []string{addrA}, cfg)
 	defer stopB()
 
 	srvA.addKnownAddr(addrB)
@@ -225,5 +295,147 @@ func TestMessageRelayAcrossPeers(t *testing.T) {
 	}
 	if p.From != alice.loginID || p.To != bob.loginID || p.Body != body {
 		t.Fatalf("unexpected payload: %+v", p)
+	}
+}
+
+func TestOversizedPacketDropped(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	cfg.maxMessageBytes = 512
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+	bob := newTestClient(t, addr)
+	defer bob.close()
+
+	hugeBody := strings.Repeat("X", 2000)
+	alice.send(t, bob.loginID, hugeBody)
+
+	if p, err := bob.recvMaybe(400 * time.Millisecond); err == nil {
+		t.Fatalf("expected no delivery for oversized packet, got: %+v", p)
+	}
+}
+
+func TestRateLimitDropsBurst(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	cfg.maxMsgsPerSec = 1
+	cfg.burstMessages = 1
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+	bob := newTestClient(t, addr)
+	defer bob.close()
+
+	alice.send(t, bob.loginID, "m1")
+	alice.send(t, bob.loginID, "m2")
+	alice.send(t, bob.loginID, "m3")
+
+	got := 0
+	for i := 0; i < 3; i++ {
+		if _, err := bob.recvMaybe(300 * time.Millisecond); err == nil {
+			got++
+		}
+	}
+	if got > 1 {
+		t.Fatalf("expected rate limiter to allow at most 1 immediate message, got %d", got)
+	}
+}
+
+func TestClientModeDisabledRejectsLogins(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, s, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	s.clientMode = clientModeDisabled
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("key generation failed: %v", err)
+	}
+	resp, err := loginWithKey(t, addr, priv)
+	if err != nil {
+		t.Fatalf("login flow failed: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Fatalf("expected error, got %+v", resp)
+	}
+	if !strings.Contains(resp.Body, "client access not allowed") {
+		t.Fatalf("unexpected error body: %q", resp.Body)
+	}
+}
+
+func TestClientModePrivateAllowlist(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, s, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	s.clientMode = clientModePrivate
+
+	allowedPub, allowedPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("allowed key generation failed: %v", err)
+	}
+	s.clientAllow[loginIDForPubKey(allowedPub)] = struct{}{}
+
+	_, blockedPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("blocked key generation failed: %v", err)
+	}
+
+	allowedResp, err := loginWithKey(t, addr, allowedPriv)
+	if err != nil {
+		t.Fatalf("allowed login flow failed: %v", err)
+	}
+	if allowedResp.Type != "ok" {
+		t.Fatalf("allowed login expected ok, got %+v", allowedResp)
+	}
+
+	blockedResp, err := loginWithKey(t, addr, blockedPriv)
+	if err != nil {
+		t.Fatalf("blocked login flow failed: %v", err)
+	}
+	if blockedResp.Type != "error" {
+		t.Fatalf("blocked login expected error, got %+v", blockedResp)
+	}
+}
+
+func TestNonRelayPeerDoesNotReceiveRelayedTraffic(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addrA, srvA, stopA := startTestServer(t, "s1", "", nil, cfg)
+	defer stopA()
+	addrB, srvB, stopB := startTestServer(t, "s1", "", nil, cfg)
+	defer stopB()
+	addrC, srvC, stopC := startTestServer(t, "s1", "", nil, cfg)
+	defer stopC()
+
+	srvA.relayEnabled = true
+	srvB.relayEnabled = true
+	srvC.relayEnabled = false
+
+	srvA.addKnownAddr(addrB)
+	srvA.addKnownAddr(addrC)
+	go srvA.dialPeer(addrB)
+	go srvA.dialPeer(addrC)
+	waitForPeerCount(t, srvA, 2, 2*time.Second)
+
+	alice := newTestClient(t, addrA)
+	defer alice.close()
+	bobRelay := newTestClient(t, addrB)
+	defer bobRelay.close()
+	bobNoRelay := newTestClient(t, addrC)
+	defer bobNoRelay.close()
+
+	alice.send(t, bobRelay.loginID, "to relay peer")
+	relayMsg := bobRelay.recv(t, 2*time.Second)
+	if relayMsg.Type != "deliver" {
+		t.Fatalf("relay peer expected deliver, got %+v", relayMsg)
+	}
+
+	alice.send(t, bobNoRelay.loginID, "to non-relay peer")
+	if p, err := bobNoRelay.recvMaybe(500 * time.Millisecond); err == nil {
+		t.Fatalf("non-relay peer should not receive relayed traffic, got %+v", p)
 	}
 }

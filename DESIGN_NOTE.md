@@ -73,6 +73,15 @@ Phase: Live-only messaging network (no persistence yet)
   - `channel_send`
   - `channel_deliver`
 
+## Operational Limits (Planned)
+- Add a configurable server memory ceiling.
+  - Example future flags: `--max-memory-mb`, `--cache-evict-policy`.
+- Add a configurable ingress rate limit.
+  - Example future flags: `--max-msgs-per-sec`, `--burst`.
+- Add a hard maximum message size and drop anything larger.
+  - Recommended default: `16 KiB` serialized packet size.
+  - Behavior: if packet size exceeds max, server ignores/drops it.
+
 ## Security Notes
 - Collision risk for login IDs is treated as cryptographically negligible.
 - Private keys never leave clients.
@@ -98,3 +107,32 @@ Later, users may run personal persistence servers with opt-in behavior:
    - cross-server relay
    - group/channel fanout
    - server identity proof handshake
+
+## Peer Policy and Abuse Handling (Current)
+
+
+## Capabilities (Current)
+- Peers advertise capability flags during handshake (`caps`).
+- Planned/expected flags include:
+  - `transport` (participates in peer mesh)
+  - `relay` (relays user traffic across peers)
+  - `client_public` (accepts any client logins)
+  - `client_private` (accepts only allowlisted clients)
+  - `client_disabled` (rejects all client logins)
+- Servers should reject client logins when `client_disabled` is set.
+
+## Protocol Evolution (Later)
+- Current protocol is JSON over TCP for clarity and iteration speed.
+- Once behavior is stable, we may add an optional faster binary protocol.
+  - This should be a negotiated capability (e.g., `proto_bin_v1`).
+  - JSON remains supported for compatibility and debugging.
+- Peers advertise inbound policy during handshake:
+  - `max_msg_bytes`
+  - `max_msgs_per_sec`
+  - `burst`
+- Each node enforces its own inbound policy.
+- Nodes use peer-advertised max message size to avoid forwarding packets that exceed a peer's declared limit.
+- Nodes maintain local peer scores and temporary bans for abusive peers.
+  - Invalid/malformed peer traffic increases score.
+  - At threshold, peer is temporarily banned.
+  - Bans are local cache state (memory only), not globally authoritative.
