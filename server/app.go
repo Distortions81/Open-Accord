@@ -44,6 +44,8 @@ const (
 	persistenceModePersist      = "persist"
 	compressionNone             = "none"
 	compressionZlib             = "zlib"
+	minPresenceTTLSec           = 180
+	maxPresenceTTLSec           = 900
 )
 
 type Packet struct {
@@ -73,6 +75,25 @@ type Packet struct {
 type profilePayload struct {
 	Nickname    string `json:"nickname,omitempty"`
 	ProfileText string `json:"profile_text,omitempty"`
+}
+
+type presencePayload struct {
+	Visible bool `json:"visible"`
+	TTLSec  int  `json:"ttl_sec"`
+}
+
+type presenceState struct {
+	Visible   bool
+	TTLSec    int
+	UpdatedAt int64
+	ExpiresAt int64
+}
+
+type presenceData struct {
+	State     string `json:"state"`
+	TTLSec    int    `json:"ttl_sec"`
+	UpdatedAt int64  `json:"updated_at,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
 }
 
 type Conn struct {
@@ -191,6 +212,7 @@ type Server struct {
 	friendAdds   map[string]map[string]struct{}
 	channels     map[string]*ChannelState
 	profiles     map[string]profilePayload
+	presence     map[string]presenceState
 	startedAt    time.Time
 
 	counter atomic.Uint64
@@ -249,6 +271,7 @@ func NewServer(id, ownerPubKeyB64 string, ownerPriv ed25519.PrivateKey, advertis
 		friendAdds:           make(map[string]map[string]struct{}),
 		channels:             make(map[string]*ChannelState),
 		profiles:             make(map[string]profilePayload),
+		presence:             make(map[string]presenceState),
 		startedAt:            time.Now(),
 	}
 }
@@ -512,7 +535,7 @@ func normalizedCompression(v string) string {
 
 func actionRequiresBody(typ string) bool {
 	switch typ {
-	case "send", "channel_send", "profile_set":
+	case "send", "channel_send", "profile_set", "presence_keepalive":
 		return true
 	default:
 		return false
@@ -1068,7 +1091,7 @@ func (s *Server) isUserOnline(loginID string) bool {
 
 func isSignedActionType(typ string) bool {
 	switch typ {
-	case "send", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get":
+	case "send", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get", "presence_keepalive":
 		return true
 	default:
 		return false
@@ -1096,9 +1119,64 @@ func validateSignedActionPacket(p Packet) bool {
 		return strings.TrimSpace(p.Body) != ""
 	case "profile_get":
 		return strings.TrimSpace(p.To) != ""
+	case "presence_keepalive":
+		return strings.TrimSpace(p.Body) != ""
 	default:
 		return false
 	}
+}
+
+func clampPresenceTTLSec(ttl int) int {
+	if ttl < minPresenceTTLSec {
+		return minPresenceTTLSec
+	}
+	if ttl > maxPresenceTTLSec {
+		return maxPresenceTTLSec
+	}
+	return ttl
+}
+
+func (s *Server) handlePresenceKeepalive(from string, body string) {
+	from = strings.TrimSpace(from)
+	if from == "" {
+		return
+	}
+	var payload presencePayload
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &payload); err != nil {
+		return
+	}
+	ttl := clampPresenceTTLSec(payload.TTLSec)
+	now := time.Now().Unix()
+	st := presenceState{
+		Visible:   payload.Visible,
+		TTLSec:    ttl,
+		UpdatedAt: now,
+		ExpiresAt: now + int64(ttl),
+	}
+	s.mu.Lock()
+	s.presence[from] = st
+	s.mu.Unlock()
+}
+
+func (s *Server) snapshotPresence(loginID string) presenceData {
+	loginID = strings.TrimSpace(loginID)
+	if loginID == "" {
+		return presenceData{State: "offline", TTLSec: minPresenceTTLSec}
+	}
+	s.mu.RLock()
+	st, ok := s.presence[loginID]
+	s.mu.RUnlock()
+	now := time.Now().Unix()
+	if !ok {
+		return presenceData{State: "offline", TTLSec: minPresenceTTLSec}
+	}
+	if !st.Visible {
+		return presenceData{State: "invisible", TTLSec: st.TTLSec, UpdatedAt: st.UpdatedAt, ExpiresAt: st.ExpiresAt}
+	}
+	if st.ExpiresAt <= now {
+		return presenceData{State: "offline", TTLSec: st.TTLSec, UpdatedAt: st.UpdatedAt, ExpiresAt: st.ExpiresAt}
+	}
+	return presenceData{State: "online", TTLSec: st.TTLSec, UpdatedAt: st.UpdatedAt, ExpiresAt: st.ExpiresAt}
 }
 
 func channelKey(group string, channel string) string {
@@ -1336,15 +1414,16 @@ func (s *Server) handlePresenceGet(requester string, target string) {
 	if requester == "" || target == "" {
 		return
 	}
-	state := "offline"
-	if s.isUserOnline(target) {
-		state = "online"
+	resp := s.snapshotPresence(target)
+	bodyBytes, err := json.Marshal(resp)
+	if err != nil {
+		return
 	}
 	_ = s.sendToUser(requester, Packet{
 		Type:   "presence_data",
 		From:   target,
 		To:     requester,
-		Body:   state,
+		Body:   string(bodyBytes),
 		Origin: s.id,
 	})
 }
@@ -1400,6 +1479,8 @@ func (s *Server) processSignedAction(p Packet) {
 		s.handleProfileSet(p)
 	case "profile_get":
 		s.handleProfileGet(p)
+	case "presence_keepalive":
+		s.handlePresenceKeepalive(p.From, p.Body)
 	}
 }
 
