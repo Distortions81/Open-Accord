@@ -73,7 +73,6 @@ start_node() {
   if (( ${#extra_args[@]} > 0 )); then
     cmd+=( "${extra_args[@]}" )
   fi
-
   nohup "${cmd[@]}" >"$log_file" 2>&1 &
   local pid="$!"
   echo "$pid" > "$pid_file"

@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"goaccord/internal/netsec"
 )
 
 const (
@@ -366,7 +369,7 @@ func (s *Server) statsSnapshot(pingTimeout time.Duration) statsSnapshot {
 			continue
 		}
 		start := time.Now()
-		conn, err := net.DialTimeout("tcp", peerList[i].Addr, pingTimeout)
+		conn, err := s.dialTimeout(peerList[i].Addr, pingTimeout)
 		if err != nil {
 			peerList[i].PingOK = false
 			continue
@@ -404,6 +407,11 @@ func (s *Server) statsSnapshot(pingTimeout time.Duration) statsSnapshot {
 		Goroutines:      runtime.NumGoroutine(),
 		PeerList:        peerList,
 	}
+}
+
+func (s *Server) dialTimeout(address string, timeout time.Duration) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	return tls.DialWithDialer(dialer, "tcp", address, netsec.ClientTLSConfigInsecure())
 }
 
 const statsPageHTML = `<!doctype html>
@@ -1258,11 +1266,11 @@ func (s *Server) handleFriendAdd(p Packet) {
 	s.mu.Unlock()
 
 	if reverseExists {
-		s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.From, To: p.To, Body: "friends"})
+		s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.From, To: p.To, Body: p.Body})
 		s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.To, To: p.From, Body: "friends"})
 		return
 	}
-	s.notifyUserOrQueue(Packet{Type: "friend_request", From: p.From, To: p.To, Body: "friend request"})
+	s.notifyUserOrQueue(Packet{Type: "friend_request", From: p.From, To: p.To, Body: p.Body})
 }
 
 func (s *Server) handleFriendAccept(p Packet) {
@@ -1278,10 +1286,10 @@ func (s *Server) handleFriendAccept(p Packet) {
 	}
 	s.mu.Unlock()
 	if !pending {
-		s.handleFriendAdd(Packet{From: p.From, To: p.To})
+		s.handleFriendAdd(Packet{From: p.From, To: p.To, Body: p.Body})
 		return
 	}
-	s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.From, To: p.To, Body: "friends"})
+	s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.From, To: p.To, Body: p.Body})
 	s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.To, To: p.From, Body: "friends"})
 }
 
@@ -1830,7 +1838,7 @@ func (s *Server) dialPeer(address string) {
 	if s.isPeerBanned(address) {
 		return
 	}
-	conn, err := net.DialTimeout("tcp", address, 4*time.Second)
+	conn, err := s.dialTimeout(address, 4*time.Second)
 	if err != nil {
 		log.Printf("peer dial %s failed: %v", address, err)
 		return

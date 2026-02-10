@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"embed"
 	"encoding/base64"
 	"encoding/hex"
@@ -29,6 +31,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"goaccord/internal/netsec"
 )
 
 type Packet struct {
@@ -71,6 +75,10 @@ type signedAction struct {
 }
 
 type keyFile struct {
+	PrivateKey string `json:"private_key"`
+}
+
+type e2eeKeyFile struct {
 	PrivateKey string `json:"private_key"`
 }
 
@@ -119,6 +127,10 @@ type presenceDataPayload struct {
 	TTLSec    int    `json:"ttl_sec"`
 	UpdatedAt int64  `json:"updated_at,omitempty"`
 	ExpiresAt int64  `json:"expires_at,omitempty"`
+}
+
+type friendKeyPayload struct {
+	E2EEPub string `json:"e2ee_pub"`
 }
 
 type contactsFile struct {
@@ -181,10 +193,12 @@ type groupEntry struct {
 type webClient struct {
 	mu sync.Mutex
 
-	enc    *json.Encoder
-	conn   net.Conn
-	priv   ed25519.PrivateKey
-	pubB64 string
+	enc     *json.Encoder
+	conn    net.Conn
+	priv    ed25519.PrivateKey
+	pubB64  string
+	e2ee    *ecdh.PrivateKey
+	e2eeB64 string
 
 	loginID      string
 	displayName  string
@@ -208,6 +222,7 @@ type webClient struct {
 	lastContext      chatContext
 	pendingPings     map[string]int64
 	seenChatIDs      map[string]struct{}
+	peerE2EE         map[string]string
 
 	events  []webEvent
 	nextSeq int64
@@ -458,6 +473,40 @@ func (c *webClient) publishOwnProfile() error {
 	return c.sendSigned(Packet{Type: "profile_set", Body: string(b)})
 }
 
+func (c *webClient) encryptDirectMessage(target string, plaintext string) (string, error) {
+	c.mu.Lock()
+	recipientPub := strings.TrimSpace(c.peerE2EE[target])
+	e2eePriv := c.e2ee
+	c.mu.Unlock()
+	if recipientPub == "" {
+		c.requestProfile(target)
+		return "", fmt.Errorf("missing recipient e2ee key; profile refresh requested")
+	}
+	return netsec.EncryptDM(e2eePriv, recipientPub, plaintext)
+}
+
+func (c *webClient) friendKeyBody() string {
+	c.mu.Lock()
+	pub := strings.TrimSpace(c.e2eeB64)
+	c.mu.Unlock()
+	if pub == "" {
+		return ""
+	}
+	b, err := json.Marshal(friendKeyPayload{E2EEPub: pub})
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func parseFriendKey(body string) string {
+	var payload friendKeyPayload
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.E2EEPub)
+}
+
 func (c *webClient) upsertNickname(loginID, nick string) {
 	loginID = strings.TrimSpace(loginID)
 	nick = strings.TrimSpace(nick)
@@ -576,6 +625,15 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				c.setPresence(p.From, "online", defaultPresenceTTLSec)
 			}
 			line := p.Body
+			if p.Type == "deliver" && strings.TrimSpace(p.Group) == "" && strings.TrimSpace(p.Channel) == "" && strings.TrimSpace(p.From) != c.loginID {
+				decodedDM, err := netsec.DecryptDM(c.e2ee, p.Body)
+				if err != nil {
+					c.addEvent("info", "dm decrypt failed from "+c.displayPeer(p.From)+": "+err.Error())
+					continue
+				} else {
+					line = decodedDM
+				}
+			}
 			if strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" {
 				c.rememberGroup(p.Group, p.Channel)
 				c.addChatEventWithActor(line, p.From, "group", "", p.Group, p.Channel)
@@ -638,6 +696,9 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				c.setPresence(p.From, "online", defaultPresenceTTLSec)
 				c.mu.Lock()
 				c.pendingFriends[p.From] = time.Now().Unix()
+				if k := parseFriendKey(p.Body); k != "" {
+					c.peerE2EE[p.From] = k
+				}
 				c.mu.Unlock()
 				c.requestProfile(p.From)
 			}
@@ -659,6 +720,13 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				}
 			}
 			if p.Type == "friend_update" {
+				if looksLikeLoginID(p.From) {
+					if k := parseFriendKey(p.Body); k != "" {
+						c.mu.Lock()
+						c.peerE2EE[p.From] = k
+						c.mu.Unlock()
+					}
+				}
 				other := p.From
 				if other == c.loginID {
 					other = p.To
@@ -1016,7 +1084,12 @@ func (c *webClient) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "message text required"})
 		return
 	}
-	if err := c.sendSigned(Packet{Type: "send", To: target, Body: text}); err != nil {
+	encryptedBody, err := c.encryptDirectMessage(target, text)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := c.sendSigned(Packet{Type: "send", To: target, Body: encryptedBody}); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1217,7 +1290,7 @@ func (c *webClient) handleFriendAdd(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown recipient"})
 		return
 	}
-	if err := c.sendSigned(Packet{Type: "friend_add", To: target}); err != nil {
+	if err := c.sendSigned(Packet{Type: "friend_add", To: target, Body: c.friendKeyBody()}); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1241,7 +1314,7 @@ func (c *webClient) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown recipient"})
 		return
 	}
-	if err := c.sendSigned(Packet{Type: "friend_accept", To: target}); err != nil {
+	if err := c.sendSigned(Packet{Type: "friend_accept", To: target, Body: c.friendKeyBody()}); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1777,6 +1850,39 @@ func loadOrCreateKey(path string) (ed25519.PrivateKey, error) {
 	return priv, nil
 }
 
+func e2eePathForKey(home string, keyPath string) string {
+	return filepath.Join(home, ".goaccord", "e2ee", "e2ee-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
+}
+
+func loadOrCreateE2EEKey(path string) (*ecdh.PrivateKey, string, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		var kf e2eeKeyFile
+		if err := json.Unmarshal(data, &kf); err != nil {
+			return nil, "", err
+		}
+		priv, pubB64, err := netsec.ParseX25519PrivateKeyB64(kf.PrivateKey)
+		if err != nil {
+			return nil, "", err
+		}
+		return priv, pubB64, nil
+	}
+	priv, pubB64, err := netsec.NewX25519Identity()
+	if err != nil {
+		return nil, "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, "", err
+	}
+	payload, err := json.MarshalIndent(e2eeKeyFile{PrivateKey: base64.StdEncoding.EncodeToString(priv.Bytes())}, "", "  ")
+	if err != nil {
+		return nil, "", err
+	}
+	if err := writeFileAtomic(path, payload, 0o600); err != nil {
+		return nil, "", err
+	}
+	return priv, pubB64, nil
+}
+
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
 	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public, CreatedAt: p.CreatedAt})
 	if err != nil {
@@ -1789,7 +1895,7 @@ func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
 func runAuth(addr string, priv ed25519.PrivateKey) (net.Conn, *json.Encoder, <-chan netMsg, string, string, error) {
 	pub := priv.Public().(ed25519.PublicKey)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := tls.Dial("tcp", addr, netsec.ClientTLSConfigInsecure())
 	if err != nil {
 		return nil, nil, nil, "", "", err
 	}
@@ -2054,6 +2160,11 @@ func main() {
 		log.Fatalf("connect/auth failed: %v", err)
 	}
 	*keyPath = selectedKeyPath
+	e2eePath := e2eePathForKey(home, *keyPath)
+	e2eePriv, e2eePubB64, err := loadOrCreateE2EEKey(e2eePath)
+	if err != nil {
+		log.Fatalf("e2ee key load failed: %v", err)
+	}
 
 	contacts, err := loadContacts(*contactsPath)
 	if err != nil {
@@ -2080,6 +2191,8 @@ func main() {
 		conn:             conn,
 		priv:             priv,
 		pubB64:           pubB64,
+		e2ee:             e2eePriv,
+		e2eeB64:          e2eePubB64,
 		loginID:          loginID,
 		displayName:      displayName,
 		profileText:      profileText,
@@ -2101,6 +2214,7 @@ func main() {
 		lastContext:      savedCtx,
 		pendingPings:     make(map[string]int64),
 		seenChatIDs:      make(map[string]struct{}),
+		peerE2EE:         make(map[string]string),
 		serverAddr:       *serverAddr,
 	}
 	for _, g := range savedGroups {

@@ -52,6 +52,12 @@ func main() {
 		os.Exit(1)
 	}
 	*keyPath = selectedKeyPath
+	e2eePath := e2eePathForKey(home, *keyPath)
+	e2eePriv, e2eePubB64, err := loadOrCreateE2EEKey(e2eePath)
+	if err != nil {
+		fmt.Printf("e2ee key load failed: %v\n", err)
+		os.Exit(1)
+	}
 
 	contacts, err := loadContacts(*contactsPath)
 	if err != nil {
@@ -90,6 +96,8 @@ func main() {
 		conn:            conn,
 		priv:            priv,
 		pubB64:          pubB64,
+		e2ee:            e2eePriv,
+		e2eeB64:         e2eePubB64,
 		loginID:         loginID,
 		contactsPath:    *contactsPath,
 		contacts:        contacts,
@@ -105,6 +113,7 @@ func main() {
 		presenceTTL:     make(map[string]int),
 		presenceVisible: true,
 		presenceTTLSec:  defaultPresenceTTLSec,
+		peerE2EE:        make(map[string]string),
 		groups:          make(map[string]map[string]struct{}),
 		pendingInvites:  make(map[string]pendingInvite),
 		lastContext:     savedCtx,

@@ -5,13 +5,17 @@ import (
 	"compress/zlib"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"goaccord/internal/netsec"
 )
 
 type testClient struct {
@@ -106,7 +110,17 @@ func startTestServer(t *testing.T, localSID, advertise string, seedAddrs []strin
 		s.addKnownAddr(seed)
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	tmpDir := t.TempDir()
+	certPath := filepath.Join(tmpDir, "server.crt")
+	keyPath := filepath.Join(tmpDir, "server.key")
+	if err := netsec.EnsureSelfSignedCert(certPath, keyPath, []string{"127.0.0.1", "localhost"}); err != nil {
+		t.Fatalf("tls cert setup failed: %v", err)
+	}
+	tcfg, err := netsec.ServerTLSConfig(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("tls config failed: %v", err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tcfg)
 	if err != nil {
 		t.Fatalf("listen failed: %v", err)
 	}
@@ -155,7 +169,7 @@ func newTestClientWithKey(t *testing.T, addr string, priv ed25519.PrivateKey) *t
 	pub := priv.Public().(ed25519.PublicKey)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
-	conn, err := net.Dial("tcp", addr)
+	conn, err := tls.Dial("tcp", addr, netsec.ClientTLSConfigInsecure())
 	if err != nil {
 		t.Fatalf("dial failed: %v", err)
 	}
@@ -202,7 +216,7 @@ func loginWithKey(t *testing.T, addr string, priv ed25519.PrivateKey) (Packet, e
 
 	pub := priv.Public().(ed25519.PublicKey)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := tls.Dial("tcp", addr, netsec.ClientTLSConfigInsecure())
 	if err != nil {
 		return Packet{}, err
 	}

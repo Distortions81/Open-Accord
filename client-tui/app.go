@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +27,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"goaccord/internal/netsec"
 )
 
 type Packet struct {
@@ -59,6 +62,10 @@ type signedAction struct {
 }
 
 type keyFile struct {
+	PrivateKey string `json:"private_key"`
+}
+
+type e2eeKeyFile struct {
 	PrivateKey string `json:"private_key"`
 }
 
@@ -101,6 +108,10 @@ type presenceDataPayload struct {
 	TTLSec    int    `json:"ttl_sec"`
 	UpdatedAt int64  `json:"updated_at,omitempty"`
 	ExpiresAt int64  `json:"expires_at,omitempty"`
+}
+
+type friendKeyPayload struct {
+	E2EEPub string `json:"e2ee_pub"`
 }
 
 type savedNickname struct {
@@ -182,6 +193,8 @@ type model struct {
 	conn    net.Conn
 	priv    ed25519.PrivateKey
 	pubB64  string
+	e2ee    *ecdh.PrivateKey
+	e2eeB64 string
 	loginID string
 	counter atomic.Uint64
 
@@ -204,6 +217,7 @@ type model struct {
 	presenceTTL       map[string]int
 	presenceVisible   bool
 	presenceTTLSec    int
+	peerE2EE          map[string]string
 	groups            map[string]map[string]struct{}
 	pendingInvites    map[string]pendingInvite
 	lastContext       chatContext
@@ -681,7 +695,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.TrimSpace(m.to) == "" {
 				return m, logLine("set recipient with /to <login_id|alias> or /chat <login_id|alias>")
 			}
-			if err := m.sendSigned(Packet{Type: "send", To: m.to, Body: line}); err != nil {
+			encryptedBody, err := m.encryptDirectMessage(m.to, line)
+			if err != nil {
+				return m, logLine("send error: " + err.Error())
+			}
+			if err := m.sendSigned(Packet{Type: "send", To: m.to, Body: encryptedBody}); err != nil {
 				return m, tea.Batch(logLine("send error: "+err.Error()), tea.Quit)
 			}
 			if m.displayPeer(m.to) == shortID(m.to) {
@@ -730,6 +748,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setPresence(msg.pkt.From, "online", defaultPresenceTTLSec)
 			}
 			line := msg.pkt.Body
+			if msg.pkt.Type == "deliver" && strings.TrimSpace(msg.pkt.Group) == "" && strings.TrimSpace(msg.pkt.Channel) == "" && strings.TrimSpace(msg.pkt.From) != m.loginID {
+				decodedDM, err := netsec.DecryptDM(m.e2ee, msg.pkt.Body)
+				if err != nil {
+					m.addInfoEntry("dm decrypt failed from " + m.displayPeer(msg.pkt.From) + ": " + err.Error())
+					return m, waitNet(m.events)
+				} else {
+					line = decodedDM
+				}
+			}
 			if msg.pkt.Origin != "" {
 				m.addInfoEntry("message via " + msg.pkt.Origin)
 			}
@@ -763,9 +790,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.pkt.Type == "friend_request" && msg.pkt.To == m.loginID && looksLikeLoginID(msg.pkt.From) {
 				m.lastFriendRequest = msg.pkt.From
+				if k := parseFriendKey(msg.pkt.Body); k != "" {
+					m.peerE2EE[msg.pkt.From] = k
+				}
 				m.requestProfile(msg.pkt.From)
 			}
 			if msg.pkt.Type == "friend_update" {
+				if looksLikeLoginID(msg.pkt.From) {
+					if k := parseFriendKey(msg.pkt.Body); k != "" {
+						m.peerE2EE[msg.pkt.From] = k
+					}
+				}
 				other := msg.pkt.From
 				if other == m.loginID {
 					other = msg.pkt.To
@@ -1479,7 +1514,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if !ok {
 			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
 		}
-		if err := m.sendSigned(Packet{Type: "friend_add", To: target}); err != nil {
+		if err := m.sendSigned(Packet{Type: "friend_add", To: target, Body: m.friendKeyBody()}); err != nil {
 			return logLine("friend-add error: " + err.Error())
 		}
 		if m.displayPeer(target) == shortID(target) {
@@ -1503,7 +1538,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if !ok {
 			return logLine("no pending friend request to accept")
 		}
-		if err := m.sendSigned(Packet{Type: "friend_accept", To: target}); err != nil {
+		if err := m.sendSigned(Packet{Type: "friend_accept", To: target, Body: m.friendKeyBody()}); err != nil {
 			return logLine("friend-accept error: " + err.Error())
 		}
 		if m.displayPeer(target) == shortID(target) {
@@ -1752,6 +1787,36 @@ func (m *model) sendSigned(p Packet) error {
 	}
 	p.Sig = sig
 	return m.enc.Encode(p)
+}
+
+func (m *model) encryptDirectMessage(target string, plaintext string) (string, error) {
+	target = strings.TrimSpace(target)
+	recipientPub := strings.TrimSpace(m.peerE2EE[target])
+	if recipientPub == "" {
+		m.requestProfile(target)
+		return "", fmt.Errorf("missing recipient e2ee key; profile refresh requested")
+	}
+	return netsec.EncryptDM(m.e2ee, recipientPub, plaintext)
+}
+
+func (m *model) friendKeyBody() string {
+	pub := strings.TrimSpace(m.e2eeB64)
+	if pub == "" {
+		return ""
+	}
+	b, err := json.Marshal(friendKeyPayload{E2EEPub: pub})
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func parseFriendKey(body string) string {
+	var payload friendKeyPayload
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.E2EEPub)
 }
 
 func encodeBodyForSend(body string) (string, string, int, error) {
@@ -2114,6 +2179,39 @@ func loadOrCreateKey(path string) (ed25519.PrivateKey, error) {
 	return priv, nil
 }
 
+func e2eePathForKey(home string, keyPath string) string {
+	return filepath.Join(home, ".goaccord", "e2ee", "e2ee-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
+}
+
+func loadOrCreateE2EEKey(path string) (*ecdh.PrivateKey, string, error) {
+	if data, err := os.ReadFile(path); err == nil {
+		var kf e2eeKeyFile
+		if err := json.Unmarshal(data, &kf); err != nil {
+			return nil, "", err
+		}
+		priv, pubB64, err := netsec.ParseX25519PrivateKeyB64(kf.PrivateKey)
+		if err != nil {
+			return nil, "", err
+		}
+		return priv, pubB64, nil
+	}
+	priv, pubB64, err := netsec.NewX25519Identity()
+	if err != nil {
+		return nil, "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, "", err
+	}
+	payload, err := json.MarshalIndent(e2eeKeyFile{PrivateKey: base64.StdEncoding.EncodeToString(priv.Bytes())}, "", "  ")
+	if err != nil {
+		return nil, "", err
+	}
+	if err := writeFileAtomic(path, payload, 0o600); err != nil {
+		return nil, "", err
+	}
+	return priv, pubB64, nil
+}
+
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
 	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public})
 	if err != nil {
@@ -2126,7 +2224,7 @@ func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
 func runAuth(addr string, priv ed25519.PrivateKey) (net.Conn, *json.Encoder, <-chan netMsg, string, string, error) {
 	pub := priv.Public().(ed25519.PublicKey)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
-	conn, err := net.Dial("tcp", addr)
+	conn, err := tls.Dial("tcp", addr, netsec.ClientTLSConfigInsecure())
 	if err != nil {
 		return nil, nil, nil, "", "", err
 	}

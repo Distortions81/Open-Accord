@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/base64"
 	"flag"
 	"log"
@@ -11,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"goaccord/internal/netsec"
 )
 
 func main() {
@@ -38,6 +41,8 @@ func main() {
 	maxPendingMsgs := flag.Int("max-pending-msgs", 500, "maximum queued offline messages per hosted user in persist mode")
 	statsHTTP := flag.Bool("stats-http", true, "enable local HTTP stats page")
 	statsAddr := flag.String("stats-addr", "", "stats HTTP listen address (default derived from -listen)")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file path (auto-generated if missing)")
+	tlsKey := flag.String("tls-key", "", "TLS private key file path (auto-generated if missing)")
 	flag.Parse()
 
 	if strings.TrimSpace(*ownerKeyPath) == "" {
@@ -46,6 +51,12 @@ func main() {
 			log.Fatalf("unable to resolve home directory: %v", err)
 		}
 		*ownerKeyPath = filepath.Join(home, ".goaccord", "server_owner_key.json")
+	}
+	if strings.TrimSpace(*tlsCert) == "" {
+		*tlsCert = strings.TrimSpace(*ownerKeyPath) + ".tls.crt"
+	}
+	if strings.TrimSpace(*tlsKey) == "" {
+		*tlsKey = strings.TrimSpace(*ownerKeyPath) + ".tls.key"
 	}
 
 	ownerPriv, err := loadOrCreateKey(*ownerKeyPath)
@@ -163,10 +174,27 @@ func main() {
 		}
 	}
 
-	ln, err := net.Listen("tcp", *listenAddr)
-	if err != nil {
-		log.Fatalf("listen error: %v", err)
+	var ln net.Listener
+	host := "localhost"
+	if parsedHost, _, err := net.SplitHostPort(*listenAddr); err == nil && strings.TrimSpace(parsedHost) != "" {
+		host = parsedHost
 	}
+	hosts := []string{host, "localhost", "127.0.0.1", "::1"}
+	if advHost, _, err := net.SplitHostPort(strings.TrimSpace(*advertiseAddr)); err == nil && strings.TrimSpace(advHost) != "" {
+		hosts = append(hosts, advHost)
+	}
+	if err := netsec.EnsureSelfSignedCert(*tlsCert, *tlsKey, hosts); err != nil {
+		log.Fatalf("tls cert setup failed: %v", err)
+	}
+	tcfg, err := netsec.ServerTLSConfig(*tlsCert, *tlsKey)
+	if err != nil {
+		log.Fatalf("tls config failed: %v", err)
+	}
+	ln, err = tls.Listen("tcp", *listenAddr, tcfg)
+	if err != nil {
+		log.Fatalf("tls listen error: %v", err)
+	}
+	log.Printf("tls required cert=%s key=%s", *tlsCert, *tlsKey)
 	log.Printf("server %q listening on %s", s.id, *listenAddr)
 	log.Printf("owner login_id %q (key: %s)", ownerLoginID, *ownerKeyPath)
 	log.Printf("limits: max-msg-bytes=%d max-uncompressed-bytes=%d max-expand-ratio=%d max-msgs-per-sec=%d burst=%d max-seen=%d max-known-addrs=%d known-addr-ttl=%s", s.maxMessageBytes, s.maxUncompressedBytes, s.maxExpandRatio, s.maxMsgsPerSec, s.burstMessages, s.maxSeenEntries, s.maxKnownAddrs, s.knownAddrTTL)

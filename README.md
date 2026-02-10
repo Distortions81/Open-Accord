@@ -50,12 +50,14 @@ go run ./client-tui -addr 127.0.0.1:9101
 - Auth handshake (`hello -> challenge -> auth -> ok`)
 - Signed actions with replay protection (`id` dedupe)
 - DM send/deliver
+- End-to-end encrypted DMs (client-side envelope over signed `send`)
 - Friend add/accept + friend updates
 - Channels: create, invite, join, leave, send
 - Profile set/get and cached profile cards
 - Web UI friend list with copy-ID action + online status check
 - Optional persistence mode with offline delivery queue for hosted users
 - Peer relay across nodes
+- TLS transport for node<->node and client<->node (required)
 - Built-in stats endpoint/page on server (`-stats-http`)
 
 ## Repository Layout
@@ -95,6 +97,8 @@ More options: `scripts/README.md`
 - `-listen` TCP listen address
 - `-peers` comma-separated seed peers
 - `-relay` relay signed actions between peers
+- `-tls-cert` TLS cert path (auto-generated if missing)
+- `-tls-key` TLS private key path (auto-generated if missing)
 - `-client-mode` `public|private|disabled`
 - `-client-allow` allowlist when `client-mode=private`
 - `-persistence-mode` `live|persist`
