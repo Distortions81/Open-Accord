@@ -30,6 +30,14 @@ func main() {
 	if strings.TrimSpace(*keyPath) == "" {
 		*keyPath = filepath.Join(home, ".goaccord", "ed25519_key.json")
 	}
+
+	selectedStartupKeyPath, err := promptIdentityPath(home, *keyPath, false)
+	if err != nil {
+		fmt.Printf("identity selection failed: %v\n", err)
+		os.Exit(1)
+	}
+	*keyPath = selectedStartupKeyPath
+
 	if strings.TrimSpace(*contactsPath) == "" {
 		*contactsPath = filepath.Join(home, ".goaccord", "contacts.json")
 	}
@@ -55,10 +63,12 @@ func main() {
 		fmt.Printf("profile load failed: %v\n", err)
 		os.Exit(1)
 	}
-	displayName = promptDisplayName(displayName)
-	if err := saveProfile(*profilePath, displayName, nicknames); err != nil {
-		fmt.Printf("profile save failed: %v\n", err)
-		os.Exit(1)
+	if strings.TrimSpace(displayName) == "" {
+		displayName = promptDisplayName(displayName)
+		if err := saveProfile(*profilePath, displayName, nicknames); err != nil {
+			fmt.Printf("profile save failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	in := textinput.New()
@@ -79,6 +89,7 @@ func main() {
 		contacts:     contacts,
 		friends:      make(map[string]struct{}),
 		profilePath:  *profilePath,
+		keyPath:      *keyPath,
 		displayName:  displayName,
 		nicknames:    nicknames,
 		group:        strings.TrimSpace(*group),

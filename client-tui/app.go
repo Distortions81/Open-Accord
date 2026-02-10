@@ -129,6 +129,7 @@ type model struct {
 	contacts     map[string]string
 	friends      map[string]struct{}
 	profilePath  string
+	keyPath      string
 	displayName  string
 	nicknames    map[string]string
 
@@ -241,6 +242,7 @@ func (m *model) shouldShow(e uiEntry) bool {
 func (m *model) commandNames() []string {
 	return []string{
 		"/help", "/to", "/use", "/contacts", "/remove-contact", "/friends",
+		"/dm", "/identities", "/switchid",
 		"/nick", "/myname",
 		"/chat", "/chat-channel", "/panels", "/focus",
 		"/group", "/channel", "/clearctx", "/whoami",
@@ -326,7 +328,7 @@ func (m *model) handleTab(line string) (string, string) {
 	}
 
 	expectsRecipient := map[string]struct{}{
-		"/to": {}, "/use": {}, "/chat": {}, "/friend-add": {}, "/friend-accept": {}, "/invite": {},
+		"/to": {}, "/use": {}, "/chat": {}, "/dm": {}, "/friend-add": {}, "/friend-accept": {}, "/invite": {},
 	}
 	if _, ok := expectsRecipient[parts[0]]; ok {
 		if len(parts) >= 2 && !strings.HasSuffix(trimmed, " ") {
@@ -388,6 +390,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.input.Width = maxInt(10, msg.Width-4)
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -468,7 +471,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "deliver", "channel_deliver":
 			line := msg.pkt.Body
 			if msg.pkt.Origin != "" {
-				line += " (via " + msg.pkt.Origin + ")"
+				m.addInfoEntry("message via " + msg.pkt.Origin)
 			}
 			if msg.pkt.Type == "deliver" {
 				other := msg.pkt.From
@@ -533,6 +536,10 @@ func (m model) View() string {
 	header := headerStyle.Render("goAccord TUI") + "  " +
 		statusStyle.Render("panel="+panelLabel+" login="+m.displayPeer(m.loginID)+" to="+emptyDash(m.displayPeer(m.to))+" group="+emptyDash(m.group)+" channel="+emptyDash(m.channel)+fmt.Sprintf(" contacts=%d friends=%d", len(m.contacts), len(m.friends)))
 
+	if m.width > 0 {
+		m.input.Width = maxInt(10, m.width-4)
+	}
+
 	visible := make([]string, 0, len(m.chatEntries))
 	for _, e := range m.chatEntries {
 		if m.shouldShow(e) {
@@ -540,9 +547,25 @@ func (m model) View() string {
 		}
 	}
 
-	maxLines := m.height - 6
-	if maxLines < 4 {
-		maxLines = 4
+	if m.width < 30 || m.height < 8 {
+		compact := "Resize terminal for full view"
+		if len(visible) > 0 {
+			compact = visible[len(visible)-1]
+		}
+		return header + "\n" + compact + "\n" + m.input.View()
+	}
+
+	infoLines := m.height / 5
+	if infoLines < 3 {
+		infoLines = 3
+	}
+	if infoLines > 8 {
+		infoLines = 8
+	}
+
+	maxLines := m.height - infoLines - 6
+	if maxLines < 3 {
+		maxLines = 3
 	}
 	start := 0
 	if len(visible) > maxLines {
@@ -553,11 +576,7 @@ func (m model) View() string {
 		body = "No messages in this panel. /panels and /focus to switch."
 	}
 
-	infoLines := m.height / 5
-	if infoLines < 4 {
-		infoLines = 4
-	}
-	maxInfo := infoLines - 2
+	maxInfo := infoLines - 1
 	if maxInfo < 1 {
 		maxInfo = 1
 	}
@@ -569,9 +588,10 @@ func (m model) View() string {
 	if strings.TrimSpace(infoBody) == "" {
 		infoBody = "No info messages"
 	}
-	infoPanel := infoBoxStyle.Width(maxInt(20, m.width-2)).Render(infoBody)
+	panelWidth := maxInt(20, m.width-2)
+	infoPanel := infoBoxStyle.Width(panelWidth).Render(infoBody)
 
-	chatPanel := chatBoxStyle.Width(maxInt(20, m.width-2)).Render(body)
+	chatPanel := chatBoxStyle.Width(panelWidth).Render(body)
 
 	input := m.input.View()
 	return header + "\n" + infoPanel + "\n" + chatPanel + "\n" + input
@@ -686,6 +706,61 @@ func (m *model) formatFriends() string {
 	return strings.Join(lines, "\n")
 }
 
+func (m *model) friendTargets() []string {
+	set := make(map[string]struct{})
+	for id := range m.friends {
+		if looksLikeLoginID(id) && id != m.loginID {
+			set[id] = struct{}{}
+		}
+	}
+	for _, id := range m.contacts {
+		if looksLikeLoginID(id) && id != m.loginID {
+			set[id] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return strings.ToLower(m.displayPeer(ids[i])) < strings.ToLower(m.displayPeer(ids[j]))
+	})
+	return ids
+}
+
+func (m *model) formatDMList() string {
+	ids := m.friendTargets()
+	if len(ids) == 0 {
+		return "no known friends/contacts"
+	}
+	lines := []string{"dm targets:"}
+	for i, id := range ids {
+		lines = append(lines, fmt.Sprintf("  %d) %s (%s)", i+1, m.displayPeer(id), id))
+	}
+	lines = append(lines, "use /dm <index|name|login_id>")
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) formatIdentityHelp() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "unable to resolve home directory for identity list"
+	}
+	items := listIdentityCandidates(home, m.keyPath)
+	lines := []string{"identities (local):"}
+	for i, c := range items {
+		marker := " "
+		if c.Path == m.keyPath {
+			marker = "*"
+		}
+		lines = append(lines, fmt.Sprintf("%s %d) %s (%s)", marker, i+1, shortID(c.LoginID), c.Path))
+	}
+	lines = append(lines, "startup always prompts for identity selection/create")
+	lines = append(lines, "quick switch now: /switchid (exits client), then relaunch and pick identity")
+	lines = append(lines, "or launch directly with: go run ./client-tui -key <identity-key-file>")
+	return strings.Join(lines, "\n")
+}
+
 func (m *model) handleCommand(line string) tea.Cmd {
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
@@ -693,13 +768,33 @@ func (m *model) handleCommand(line string) tea.Cmd {
 	}
 	switch parts[0] {
 	case "/help":
-		return logLine("commands: /to /use /chat /chat-channel /panels /focus /contacts /friends /remove-contact /nick /myname /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
-	case "/to", "/use", "/chat":
+		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
+	case "/to", "/use", "/chat", "/dm":
+		if parts[0] == "/dm" && len(parts) < 2 {
+			return logLine(m.formatDMList())
+		}
 		if len(parts) < 2 {
 			return logLine("usage: " + parts[0] + " <login_id|alias>")
 		}
-		target, ok := m.resolveRecipient(parts[1])
+		token := strings.TrimSpace(parts[1])
+		target := ""
+		ok := false
+		if parts[0] == "/dm" {
+			if idx, err := strconv.Atoi(token); err == nil {
+				ids := m.friendTargets()
+				if idx >= 1 && idx <= len(ids) {
+					target = ids[idx-1]
+					ok = true
+				}
+			}
+		}
 		if !ok {
+			target, ok = m.resolveRecipient(token)
+		}
+		if !ok {
+			if parts[0] == "/dm" {
+				return logLine("unknown dm target: " + token + "\n" + m.formatDMList())
+			}
 			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
 		}
 		m.to = target
@@ -733,6 +828,12 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		return logLine(m.formatContacts())
 	case "/friends":
 		return logLine(m.formatFriends())
+	case "/identities":
+		return logLine(m.formatIdentityHelp())
+	case "/switchid":
+		m.addInfoEntry("switch identity: client exiting, relaunch to choose/create identity")
+		_ = m.conn.Close()
+		return tea.Quit
 	case "/remove-contact":
 		if len(parts) < 2 {
 			return logLine("usage: /remove-contact <alias>")
@@ -1414,17 +1515,25 @@ func listIdentityCandidates(home string, currentPath string) []identityCandidate
 	return out
 }
 
-func promptIdentityPath(home string, currentPath string) (string, error) {
+func promptIdentityPath(home string, currentPath string, conflictMode bool) (string, error) {
 	candidates := listIdentityCandidates(home, currentPath)
-	fmt.Println("login_id already connected on the server.")
-	fmt.Println("Choose an identity to use:")
+	if conflictMode {
+		fmt.Println("login_id already connected on the server.")
+		fmt.Println("Choose a different identity:")
+	} else {
+		fmt.Println("Choose an identity to use:")
+	}
 	idx := 1
 	indexToPath := make(map[int]string)
 	for _, c := range candidates {
-		if c.Path == currentPath {
+		if conflictMode && c.Path == currentPath {
 			continue
 		}
-		fmt.Printf("  %d) switch to %s (%s)\n", idx, shortID(c.LoginID), c.Path)
+		currentMark := ""
+		if c.Path == currentPath {
+			currentMark = " [current]"
+		}
+		fmt.Printf("  %d) %s (%s)%s\n", idx, shortID(c.LoginID), c.Path, currentMark)
 		indexToPath[idx] = c.Path
 		idx++
 	}
@@ -1477,7 +1586,7 @@ func connectWithIdentitySelection(addr string, home string, initialKeyPath strin
 		if !strings.Contains(err.Error(), "login id already connected") {
 			return "", nil, nil, nil, nil, "", "", err
 		}
-		nextKeyPath, pickErr := promptIdentityPath(home, keyPath)
+		nextKeyPath, pickErr := promptIdentityPath(home, keyPath, true)
 		if pickErr != nil {
 			return "", nil, nil, nil, nil, "", "", err
 		}
