@@ -822,7 +822,11 @@ func (m *model) formatIdentityHelp() string {
 		if c.Path == m.keyPath {
 			marker = "*"
 		}
-		lines = append(lines, fmt.Sprintf("%s %d) %s (%s)", marker, i+1, shortID(c.LoginID), c.Path))
+		label := strings.TrimSpace(c.Name)
+		if label == "" {
+			label = shortID(c.LoginID)
+		}
+		lines = append(lines, fmt.Sprintf("%s %d) %s [%s] (%s)", marker, i+1, label, shortID(c.LoginID), c.Path))
 	}
 	lines = append(lines, "startup always prompts for identity selection/create")
 	lines = append(lines, "quick switch now: /switchid (exits client), then relaunch and pick identity")
@@ -1680,6 +1684,11 @@ func (m *model) nextMessageID() string {
 type identityCandidate struct {
 	Path    string
 	LoginID string
+	Name    string
+}
+
+func profilePathForKey(home string, keyPath string) string {
+	return filepath.Join(home, ".goaccord", "profiles", "profile-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
@@ -1756,7 +1765,8 @@ func listIdentityCandidates(home string, currentPath string) []identityCandidate
 			continue
 		}
 		pub := priv.Public().(ed25519.PublicKey)
-		out = append(out, identityCandidate{Path: p, LoginID: loginIDForPubKey(pub)})
+		name, _, _, _, _ := loadProfile(profilePathForKey(home, p))
+		out = append(out, identityCandidate{Path: p, LoginID: loginIDForPubKey(pub), Name: strings.TrimSpace(name)})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Path == currentPath {
@@ -1788,7 +1798,11 @@ func promptIdentityPath(home string, currentPath string, conflictMode bool) (str
 		if c.Path == currentPath {
 			currentMark = " [current]"
 		}
-		fmt.Printf("  %d) %s (%s)%s\n", idx, shortID(c.LoginID), c.Path, currentMark)
+		label := strings.TrimSpace(c.Name)
+		if label == "" {
+			label = shortID(c.LoginID)
+		}
+		fmt.Printf("  %d) %s [%s] (%s)%s\n", idx, label, shortID(c.LoginID), c.Path, currentMark)
 		indexToPath[idx] = c.Path
 		idx++
 	}

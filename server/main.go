@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,6 +36,8 @@ func main() {
 	persistenceDB := flag.String("persistence-db", "", "sqlite database path (used when persistence-mode=persist)")
 	persistAutoHost := flag.Bool("persist-auto-host", true, "auto-register authenticated users as hosted users in persist mode")
 	maxPendingMsgs := flag.Int("max-pending-msgs", 500, "maximum queued offline messages per hosted user in persist mode")
+	statsHTTP := flag.Bool("stats-http", true, "enable local HTTP stats page")
+	statsAddr := flag.String("stats-addr", "", "stats HTTP listen address (default derived from -listen)")
 	flag.Parse()
 
 	if strings.TrimSpace(*ownerKeyPath) == "" {
@@ -131,6 +134,24 @@ func main() {
 	}
 	go s.cleanupSeen(10 * time.Minute)
 	go s.peerManager()
+	if *statsHTTP {
+		addr := strings.TrimSpace(*statsAddr)
+		if addr == "" {
+			if host, port, err := net.SplitHostPort(*listenAddr); err == nil {
+				if n, err := strconv.Atoi(port); err == nil {
+					statsPort := n + 1000
+					if host == "" || host == "0.0.0.0" || host == "::" {
+						host = "127.0.0.1"
+					}
+					addr = net.JoinHostPort(host, strconv.Itoa(statsPort))
+				}
+			}
+		}
+		if addr == "" {
+			addr = "127.0.0.1:10000"
+		}
+		s.startStatsHTTP(addr)
+	}
 
 	if strings.TrimSpace(*peersCSV) != "" {
 		for _, peer := range strings.Split(*peersCSV, ",") {

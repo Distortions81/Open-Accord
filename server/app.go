@@ -14,8 +14,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -188,6 +191,7 @@ type Server struct {
 	friendAdds   map[string]map[string]struct{}
 	channels     map[string]*ChannelState
 	profiles     map[string]profilePayload
+	startedAt    time.Time
 
 	counter atomic.Uint64
 }
@@ -245,7 +249,191 @@ func NewServer(id, ownerPubKeyB64 string, ownerPriv ed25519.PrivateKey, advertis
 		friendAdds:           make(map[string]map[string]struct{}),
 		channels:             make(map[string]*ChannelState),
 		profiles:             make(map[string]profilePayload),
+		startedAt:            time.Now(),
 	}
+}
+
+type statsPeer struct {
+	ID            string   `json:"id"`
+	Addr          string   `json:"addr"`
+	Caps          []string `json:"caps"`
+	MaxMsgBytes   int      `json:"max_msg_bytes"`
+	MaxMsgsPerSec int      `json:"max_msgs_per_sec"`
+	Burst         int      `json:"burst"`
+	Score         int      `json:"score"`
+	BannedUntil   string   `json:"banned_until,omitempty"`
+	PingMS        int64    `json:"ping_ms,omitempty"`
+	PingOK        bool     `json:"ping_ok"`
+}
+
+type statsSnapshot struct {
+	ServerID        string      `json:"server_id"`
+	StartedAt       time.Time   `json:"started_at"`
+	UptimeSec       int64       `json:"uptime_sec"`
+	AdvertiseAddr   string      `json:"advertise_addr,omitempty"`
+	Users           int         `json:"users"`
+	UserSessions    int         `json:"user_sessions"`
+	Peers           int         `json:"peers"`
+	KnownAddrs      int         `json:"known_addrs"`
+	SeenIDs         int         `json:"seen_ids"`
+	PendingDial     int         `json:"pending_dial"`
+	ProfilesCached  int         `json:"profiles_cached"`
+	PersistenceMode string      `json:"persistence_mode"`
+	RelayEnabled    bool        `json:"relay_enabled"`
+	ClientMode      string      `json:"client_mode"`
+	MaxMessageBytes int         `json:"max_message_bytes"`
+	MaxUncompressed int         `json:"max_uncompressed_bytes"`
+	MaxExpandRatio  int         `json:"max_expand_ratio"`
+	MaxMsgsPerSec   int         `json:"max_msgs_per_sec"`
+	BurstMessages   int         `json:"burst_messages"`
+	MemAlloc        uint64      `json:"mem_alloc"`
+	MemSys          uint64      `json:"mem_sys"`
+	Goroutines      int         `json:"goroutines"`
+	PeerList        []statsPeer `json:"peer_list"`
+}
+
+func (s *Server) statsSnapshot(pingTimeout time.Duration) statsSnapshot {
+	s.mu.RLock()
+	users := len(s.users)
+	userSessions := 0
+	for _, conns := range s.users {
+		userSessions += len(conns)
+	}
+	peerList := make([]statsPeer, 0, len(s.peers))
+	for id, p := range s.peers {
+		caps := make([]string, 0, len(p.caps))
+		for c := range p.caps {
+			caps = append(caps, c)
+		}
+		sort.Strings(caps)
+		sp := statsPeer{ID: id, Addr: p.addr, Caps: caps, MaxMsgBytes: p.maxMsgBytes, MaxMsgsPerSec: p.maxMsgsPerSec, Burst: p.burst, Score: s.peerScore[p.addr]}
+		if until, ok := s.peerBanned[p.addr]; ok && until.After(time.Now()) {
+			sp.BannedUntil = until.Format(time.RFC3339)
+		}
+		peerList = append(peerList, sp)
+	}
+	knownAddrs := len(s.knownAddrs)
+	seenIDs := len(s.seen)
+	pendingDial := len(s.dialing)
+	profilesCached := len(s.profiles)
+	startedAt := s.startedAt
+	id := s.id
+	advertise := s.advertiseAddr
+	persistenceMode := s.persistenceMode
+	relayEnabled := s.relayEnabled
+	clientMode := s.clientMode
+	maxMessageBytes := s.maxMessageBytes
+	maxUncompressed := s.maxUncompressedBytes
+	maxExpandRatio := s.maxExpandRatio
+	maxMsgsPerSec := s.maxMsgsPerSec
+	burstMessages := s.burstMessages
+	s.mu.RUnlock()
+
+	sort.Slice(peerList, func(i, j int) bool { return peerList[i].ID < peerList[j].ID })
+	for i := range peerList {
+		if strings.TrimSpace(peerList[i].Addr) == "" {
+			continue
+		}
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", peerList[i].Addr, pingTimeout)
+		if err != nil {
+			peerList[i].PingOK = false
+			continue
+		}
+		_ = conn.Close()
+		peerList[i].PingMS = time.Since(start).Milliseconds()
+		peerList[i].PingOK = true
+	}
+
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	return statsSnapshot{
+		ServerID:        id,
+		StartedAt:       startedAt,
+		UptimeSec:       int64(time.Since(startedAt).Seconds()),
+		AdvertiseAddr:   advertise,
+		Users:           users,
+		UserSessions:    userSessions,
+		Peers:           len(peerList),
+		KnownAddrs:      knownAddrs,
+		SeenIDs:         seenIDs,
+		PendingDial:     pendingDial,
+		ProfilesCached:  profilesCached,
+		PersistenceMode: persistenceMode,
+		RelayEnabled:    relayEnabled,
+		ClientMode:      clientMode,
+		MaxMessageBytes: maxMessageBytes,
+		MaxUncompressed: maxUncompressed,
+		MaxExpandRatio:  maxExpandRatio,
+		MaxMsgsPerSec:   maxMsgsPerSec,
+		BurstMessages:   burstMessages,
+		MemAlloc:        ms.Alloc,
+		MemSys:          ms.Sys,
+		Goroutines:      runtime.NumGoroutine(),
+		PeerList:        peerList,
+	}
+}
+
+const statsPageHTML = `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>goAccord Node Stats</title>
+<style>
+body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0f1318;color:#e6edf3;margin:0;padding:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.card{background:#1a222b;border:1px solid #2d3742;border-radius:8px;padding:10px}
+pre{margin:0;white-space:pre-wrap;word-wrap:break-word}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{border-bottom:1px solid #2d3742;padding:4px;text-align:left}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+</style></head>
+<body>
+<h2>goAccord Node Stats</h2>
+<div class="grid">
+<div class="card"><h3>Summary</h3><pre id="summary"></pre></div>
+<div class="card"><h3>Runtime</h3><pre id="runtime"></pre></div>
+</div>
+<div class="card" style="margin-top:12px"><h3>Peers</h3><table><thead><tr><th>ID</th><th>Addr</th><th>Ping</th><th>Caps</th><th>Limits</th><th>Score</th></tr></thead><tbody id="peers"></tbody></table></div>
+<script>
+async function tick(){
+ const r=await fetch('/api/stats'); const d=await r.json();
+ document.getElementById('summary').textContent=
+  'server=' + d.server_id + '\n' +
+  'users=' + d.users + ' sessions=' + d.user_sessions + ' peers=' + d.peers + '\n' +
+  'known_addrs=' + d.known_addrs + ' seen_ids=' + d.seen_ids + ' dialing=' + d.pending_dial + '\n' +
+  'profiles_cached=' + d.profiles_cached + ' persistence=' + d.persistence_mode + ' relay=' + d.relay_enabled + ' client_mode=' + d.client_mode;
+ document.getElementById('runtime').textContent=
+  'uptime_sec=' + d.uptime_sec + '\n' +
+  'mem_alloc=' + d.mem_alloc + ' mem_sys=' + d.mem_sys + '\n' +
+  'goroutines=' + d.goroutines + '\n' +
+  'max_msg_bytes=' + d.max_message_bytes + ' max_uncompressed=' + d.max_uncompressed_bytes + ' expand_ratio=' + d.max_expand_ratio + '\n' +
+  'max_msgs_per_sec=' + d.max_msgs_per_sec + ' burst=' + d.burst_messages;
+ const tb=document.getElementById('peers'); tb.innerHTML='';
+ for(const p of d.peer_list||[]){
+  const tr=document.createElement('tr');
+  tr.innerHTML='<td>' + p.id + '</td><td>' + (p.addr||'') + '</td><td>' + (p.ping_ok? (p.ping_ms+"ms") : '-') + '</td><td>' + ((p.caps||[]).join(',')) + '</td><td>' + p.max_msg_bytes + '/' + p.max_msgs_per_sec + '/' + p.burst + '</td><td>' + p.score + (p.banned_until? ' banned' : '') + '</td>';
+  tb.appendChild(tr);
+ }
+}
+setInterval(()=>tick().catch(()=>{}),2000); tick().catch(()=>{});
+</script></body></html>`
+
+func (s *Server) startStatsHTTP(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, statsPageHTML)
+	})
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(s.statsSnapshot(750 * time.Millisecond))
+	})
+	go func() {
+		log.Printf("stats http listening on %s", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("stats http failed: %v", err)
+		}
+	}()
 }
 
 func readPacketLine(reader *bufio.Reader, maxBytes int, out *Packet) (decoded bool, oversized bool, err error) {
