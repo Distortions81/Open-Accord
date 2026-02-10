@@ -81,6 +81,18 @@ type profileFile struct {
 	PeerProfiles  []savedProfile  `json:"peer_profiles"`
 }
 
+type chatContext struct {
+	Mode    string `json:"mode,omitempty"` // dm|group
+	Target  string `json:"target,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Channel string `json:"channel,omitempty"`
+}
+
+type uiStateFile struct {
+	Groups      []groupEntry `json:"groups,omitempty"`
+	LastContext chatContext  `json:"last_context,omitempty"`
+}
+
 type savedNickname struct {
 	LoginID  string `json:"login_id"`
 	Nickname string `json:"nickname"`
@@ -133,6 +145,10 @@ func profilePathForKey(home string, keyPath string) string {
 	return filepath.Join(home, ".goaccord", "profiles", "profile-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
 }
 
+func uiStatePathForProfile(profilePath string) string {
+	return strings.TrimSpace(profilePath) + ".ui.json"
+}
+
 type webEvent struct {
 	Seq        int64  `json:"seq"`
 	Kind       string `json:"kind"`
@@ -155,6 +171,7 @@ type dmTarget struct {
 type groupEntry struct {
 	Name     string   `json:"name"`
 	Channels []string `json:"channels,omitempty"`
+	Owned    bool     `json:"owned,omitempty"`
 }
 
 type webClient struct {
@@ -170,6 +187,7 @@ type webClient struct {
 	profileText  string
 	contactsPath string
 	profilePath  string
+	uiStatePath  string
 
 	contacts         map[string]string
 	nicknames        map[string]string
@@ -182,7 +200,10 @@ type webClient struct {
 	friends          map[string]struct{}
 	pendingFriends   map[string]int64
 	groups           map[string]map[string]struct{}
+	ownedGroups      map[string]struct{}
+	lastContext      chatContext
 	pendingPings     map[string]int64
+	seenChatIDs      map[string]struct{}
 
 	events  []webEvent
 	nextSeq int64
@@ -439,6 +460,18 @@ func (c *webClient) rememberGroup(group string, channel string) {
 		c.groups[group][channel] = struct{}{}
 	}
 	c.mu.Unlock()
+	c.persistUIState()
+}
+
+func (c *webClient) forgetGroup(group string) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return
+	}
+	c.mu.Lock()
+	delete(c.groups, group)
+	c.mu.Unlock()
+	c.persistUIState()
 }
 
 func messageMeta(p Packet) string {
@@ -483,6 +516,22 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 		p := ev.pkt
 		switch p.Type {
 		case "deliver", "channel_deliver":
+			msgID := strings.TrimSpace(p.ID)
+			if msgID != "" {
+				c.mu.Lock()
+				if _, exists := c.seenChatIDs[msgID]; exists {
+					c.mu.Unlock()
+					continue
+				}
+				c.seenChatIDs[msgID] = struct{}{}
+				if len(c.seenChatIDs) > 5000 {
+					c.seenChatIDs = make(map[string]struct{})
+				}
+				c.mu.Unlock()
+			}
+			if looksLikeLoginID(p.From) {
+				c.setPresence(p.From, "online", defaultPresenceTTLSec)
+			}
 			line := p.Body
 			if strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" {
 				c.rememberGroup(p.Group, p.Channel)
@@ -496,6 +545,9 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				c.addEvent("info", "message via "+p.Origin)
 			}
 		case "ping":
+			if looksLikeLoginID(p.From) {
+				c.setPresence(p.From, "online", defaultPresenceTTLSec)
+			}
 			if meta := messageMeta(p); meta != "" {
 				c.addEvent("info", fmt.Sprintf("ping from=%s %s", c.displayPeer(p.From), meta))
 			} else {
@@ -504,6 +556,9 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			replyBody, _ := json.Marshal(map[string]any{"ping_id": p.ID, "ping_created_at": p.CreatedAt})
 			_ = c.sendSigned(Packet{Type: "pong", To: p.From, Body: string(replyBody)})
 		case "pong":
+			if looksLikeLoginID(p.From) {
+				c.setPresence(p.From, "online", defaultPresenceTTLSec)
+			}
 			var payload struct {
 				PingID        string `json:"ping_id"`
 				PingCreatedAt int64  `json:"ping_created_at"`
@@ -532,6 +587,7 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			}
 		case "friend_request":
 			if p.To == c.loginID && looksLikeLoginID(p.From) {
+				c.setPresence(p.From, "online", defaultPresenceTTLSec)
 				c.mu.Lock()
 				c.pendingFriends[p.From] = time.Now().Unix()
 				c.mu.Unlock()
@@ -539,8 +595,20 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			}
 			c.addEvent("info", fmt.Sprintf("friend request from %s", c.displayPeer(p.From)))
 		case "friend_update", "channel_invite", "channel_update", "channel_joined":
+			if looksLikeLoginID(p.From) {
+				c.setPresence(p.From, "online", defaultPresenceTTLSec)
+			}
 			if strings.TrimSpace(p.Group) != "" {
 				c.rememberGroup(p.Group, p.Channel)
+			}
+			if p.Type == "channel_update" && p.From == c.loginID {
+				body := strings.ToLower(strings.TrimSpace(p.Body))
+				if body == "created" {
+					c.mu.Lock()
+					c.ownedGroups[strings.TrimSpace(p.Group)] = struct{}{}
+					c.mu.Unlock()
+					c.persistUIState()
+				}
 			}
 			if p.Type == "friend_update" {
 				other := p.From
@@ -556,6 +624,9 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			}
 			c.addEvent("info", fmt.Sprintf("[%s] from=%s to=%s %s", p.Type, c.displayPeer(p.From), c.displayPeer(p.To), strings.TrimSpace(p.Body)))
 		case "profile_data":
+			if looksLikeLoginID(p.From) {
+				c.setPresence(p.From, "online", defaultPresenceTTLSec)
+			}
 			decoded, err := decodeTextBodyForClient(p)
 			if err != nil {
 				c.addEvent("info", "profile decode failed: "+err.Error())
@@ -703,9 +774,46 @@ func (c *webClient) groupsList() []groupEntry {
 			}
 		}
 		sort.Strings(channels)
-		out = append(out, groupEntry{Name: g, Channels: channels})
+		_, owned := c.ownedGroups[g]
+		out = append(out, groupEntry{Name: g, Channels: channels, Owned: owned})
 	}
 	return out
+}
+
+func (c *webClient) persistUIState() {
+	groups := c.groupsList()
+	c.mu.Lock()
+	ctx := c.lastContext
+	path := c.uiStatePath
+	c.mu.Unlock()
+	_ = saveUIState(path, groups, ctx)
+}
+
+func (c *webClient) setLastContext(ctx chatContext) {
+	ctx.Mode = strings.ToLower(strings.TrimSpace(ctx.Mode))
+	if ctx.Mode != "dm" && ctx.Mode != "group" {
+		ctx.Mode = ""
+	}
+	ctx.Target = strings.TrimSpace(ctx.Target)
+	ctx.Group = strings.TrimSpace(ctx.Group)
+	ctx.Channel = strings.TrimSpace(ctx.Channel)
+	if ctx.Mode == "group" && ctx.Channel == "" {
+		ctx.Channel = "default"
+	}
+	c.mu.Lock()
+	c.lastContext = ctx
+	c.mu.Unlock()
+	c.persistUIState()
+}
+
+func (c *webClient) handleContextSet(w http.ResponseWriter, r *http.Request) {
+	var req chatContext
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	c.setLastContext(req)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (c *webClient) profileCard(loginID string) dmTarget {
@@ -742,6 +850,7 @@ func (c *webClient) handleBootstrap(w http.ResponseWriter, _ *http.Request) {
 		"targets":           c.dmTargets(),
 		"pending_friends":   c.pendingFriendRequests(),
 		"groups":            c.groupsList(),
+		"last_context":      c.lastContext,
 		"presence_visible":  c.presenceVisible,
 		"presence_ttl_sec":  c.presenceTTLSec,
 		"presence_ttl_min":  minPresenceTTLSec,
@@ -801,6 +910,158 @@ func (c *webClient) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	c.addEventWithActor("chat", text, c.loginID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func normalizeGroupName(v string) string {
+	return strings.TrimSpace(v)
+}
+
+func normalizeChannelName(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "default"
+	}
+	return v
+}
+
+func (c *webClient) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Group   string `json:"group"`
+		Channel string `json:"channel"`
+		Public  *bool  `json:"public"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	group := normalizeGroupName(req.Group)
+	channel := normalizeChannelName(req.Channel)
+	if group == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group required"})
+		return
+	}
+	public := true
+	if req.Public != nil {
+		public = *req.Public
+	}
+	if err := c.sendSigned(Packet{Type: "channel_create", Group: group, Channel: channel, Public: public}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.rememberGroup(group, channel)
+	c.mu.Lock()
+	c.ownedGroups[group] = struct{}{}
+	c.mu.Unlock()
+	c.persistUIState()
+	c.addEvent("info", fmt.Sprintf("group created: %s/%s (%s)", group, channel, map[bool]string{true: "public", false: "private"}[public]))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group, "channel": channel, "public": public})
+}
+
+func (c *webClient) handleGroupJoin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Group   string `json:"group"`
+		Channel string `json:"channel"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	group := normalizeGroupName(req.Group)
+	channel := normalizeChannelName(req.Channel)
+	if group == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group required"})
+		return
+	}
+	if err := c.sendSigned(Packet{Type: "channel_join", Group: group, Channel: channel}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.rememberGroup(group, channel)
+	c.addEvent("info", fmt.Sprintf("group join requested: %s/%s", group, channel))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group, "channel": channel})
+}
+
+func (c *webClient) handleGroupSend(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Group   string `json:"group"`
+		Channel string `json:"channel"`
+		Text    string `json:"text"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	group := normalizeGroupName(req.Group)
+	channel := normalizeChannelName(req.Channel)
+	text := strings.TrimSpace(req.Text)
+	if group == "" || text == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group and text required"})
+		return
+	}
+	if err := c.sendSigned(Packet{Type: "channel_send", Group: group, Channel: channel, Body: text}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.rememberGroup(group, channel)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (c *webClient) handleGroupRemove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Group string `json:"group"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	group := normalizeGroupName(req.Group)
+	if group == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group required"})
+		return
+	}
+	c.forgetGroup(group)
+	c.addEvent("info", "group removed: "+group)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (c *webClient) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Group   string   `json:"group"`
+		Channel string   `json:"channel"`
+		To      []string `json:"to"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	group := normalizeGroupName(req.Group)
+	channel := normalizeChannelName(req.Channel)
+	if group == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group required"})
+		return
+	}
+	if len(req.To) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at least one recipient required"})
+		return
+	}
+	sent := 0
+	for _, token := range req.To {
+		target, ok := c.resolveRecipient(token)
+		if !ok {
+			continue
+		}
+		if err := c.sendSigned(Packet{Type: "channel_invite", To: target, Group: group, Channel: channel}); err != nil {
+			continue
+		}
+		sent++
+	}
+	if sent == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no valid recipients"})
+		return
+	}
+	c.rememberGroup(group, channel)
+	c.addEvent("info", fmt.Sprintf("group invite sent: %s/%s recipients=%d", group, channel, sent))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sent": sent})
 }
 
 func (c *webClient) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -1183,6 +1444,36 @@ func writeContactsAtomic(path string, contacts map[string]string) error {
 	for _, a := range aliases {
 		f.Contacts = append(f.Contacts, savedContact{Alias: a, LoginID: contacts[a]})
 	}
+	payload, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, payload, 0o600)
+}
+
+func loadUIState(path string) ([]groupEntry, chatContext, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, chatContext{}, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, chatContext{}, nil
+		}
+		return nil, chatContext{}, err
+	}
+	var f uiStateFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, chatContext{}, err
+	}
+	return f.Groups, f.LastContext, nil
+}
+
+func saveUIState(path string, groups []groupEntry, ctx chatContext) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	f := uiStateFile{Groups: groups, LastContext: ctx}
 	payload, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
@@ -1657,6 +1948,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("profile load failed: %v", err)
 	}
+	uiStatePath := uiStatePathForProfile(*profilePath)
+	savedGroups, savedCtx, err := loadUIState(uiStatePath)
+	if err != nil {
+		log.Fatalf("ui state load failed: %v", err)
+	}
 	if strings.TrimSpace(displayName) == "" {
 		displayName = promptDisplayName(displayName)
 		if err := saveProfile(*profilePath, displayName, profileText, nicknames, peerProfiles, profileRefreshed); err != nil {
@@ -1674,6 +1970,7 @@ func main() {
 		profileText:      profileText,
 		contactsPath:     *contactsPath,
 		profilePath:      *profilePath,
+		uiStatePath:      uiStatePath,
 		contacts:         contacts,
 		nicknames:        nicknames,
 		peerProfiles:     peerProfiles,
@@ -1685,7 +1982,29 @@ func main() {
 		friends:          make(map[string]struct{}),
 		pendingFriends:   make(map[string]int64),
 		groups:           make(map[string]map[string]struct{}),
+		ownedGroups:      make(map[string]struct{}),
+		lastContext:      savedCtx,
 		pendingPings:     make(map[string]int64),
+		seenChatIDs:      make(map[string]struct{}),
+	}
+	for _, g := range savedGroups {
+		group := strings.TrimSpace(g.Name)
+		if group == "" {
+			continue
+		}
+		if len(g.Channels) == 0 {
+			client.rememberGroup(group, "default")
+			if g.Owned {
+				client.ownedGroups[group] = struct{}{}
+			}
+			continue
+		}
+		for _, ch := range g.Channels {
+			client.rememberGroup(group, ch)
+		}
+		if g.Owned {
+			client.ownedGroups[group] = struct{}{}
+		}
 	}
 	client.addEvent("info", "connected to "+*serverAddr)
 	client.addEvent("info", "login_id: "+loginID)
@@ -1725,6 +2044,12 @@ func main() {
 	mux.HandleFunc("/api/targets", client.handleTargets)
 	mux.HandleFunc("/api/groups", client.handleGroups)
 	mux.HandleFunc("/api/send", client.handleSend)
+	mux.HandleFunc("/api/group/create", client.handleGroupCreate)
+	mux.HandleFunc("/api/group/join", client.handleGroupJoin)
+	mux.HandleFunc("/api/group/send", client.handleGroupSend)
+	mux.HandleFunc("/api/group/remove", client.handleGroupRemove)
+	mux.HandleFunc("/api/group/invite", client.handleGroupInvite)
+	mux.HandleFunc("/api/context/set", client.handleContextSet)
 	mux.HandleFunc("/api/ping", client.handlePing)
 	mux.HandleFunc("/api/friend/add", client.handleFriendAdd)
 	mux.HandleFunc("/api/friend/accept", client.handleFriendAccept)

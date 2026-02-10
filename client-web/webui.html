@@ -13,7 +13,26 @@
     .left-panel { position:relative; padding-bottom:56px; }
     .right-col { display:grid; grid-template-rows: minmax(140px, 34%) 1fr; gap:12px; min-height:0; }
     .friend-list { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; border:1px solid var(--line); border-radius:8px; padding:6px; }
-    .group-list { max-height:24vh; overflow:auto; border:1px solid var(--line); border-radius:8px; padding:6px; }
+    .group-list { max-height:20vh; overflow:auto; border:1px solid var(--line); border-radius:8px; padding:6px; }
+    .channel-list { max-height:16vh; overflow:auto; border:1px solid var(--line); border-radius:8px; padding:6px; margin-top:6px; }
+    .group-row { display:flex; align-items:center; gap:8px; justify-content:space-between; padding:6px 4px; border-bottom:1px solid #223040; cursor:pointer; }
+    .group-name { min-width:0; overflow-wrap:anywhere; word-break:break-word; font-weight:700; flex:1; }
+    .row-icon-btn {
+      width:auto; min-width:0; margin:0; padding:2px 7px; border-radius:999px;
+      border:1px solid #2d3c4b; background:#0f1620; color:#8e9aa7; cursor:pointer;
+      line-height:1; font-weight:700;
+    }
+    .header-row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .header-row h3 { margin:0; }
+    .invite-editor {
+      position:fixed; right:14px; bottom:14px; width:320px; z-index:1200;
+      box-shadow:0 10px 28px rgba(0,0,0,.45);
+      max-height:70vh;
+    }
+    .invite-list { max-height:32vh; overflow:auto; border:1px solid var(--line); border-radius:8px; padding:6px; margin:6px 0; }
+    .chk-row { display:flex; align-items:center; gap:8px; padding:4px 2px; }
+    .chk-row input { width:auto; margin:0; }
+    .sel-row { background:#0f1924; border-radius:6px; }
     h3 { margin:0 0 8px; font-size:12px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase; }
     pre { margin:0; white-space:pre-wrap; word-wrap:break-word; overflow-wrap:anywhere; flex:1; min-height:0; overflow:auto; }
     input, textarea, button, select { width:100%; box-sizing:border-box; margin:4px 0; padding:7px 8px; border-radius:8px; border:1px solid #2d3c4b; background:#10171f; color:var(--text); }
@@ -111,8 +130,16 @@
   <div class="panel left-panel">
     <h3 style="margin-top:12px">Friends: <span id="friendsUserName" class="friends-user"></span></h3>
     <div id="friendList" class="small friend-list"></div>
-    <h3 style="margin-top:10px">Groups</h3>
+    <div class="header-row" style="margin-top:10px;">
+      <h3>Servers</h3>
+      <button id="serverCreateBtn" class="row-icon-btn" title="Create server/group" style="color:#8ecbff;">+</button>
+    </div>
     <div id="groupList" class="small group-list"></div>
+    <div class="header-row" style="margin-top:8px;">
+      <h3>Channels</h3>
+      <button id="channelCreateBtn" class="row-icon-btn" title="Create channel" style="color:#8ecbff;" hidden>+</button>
+    </div>
+    <div id="channelList" class="small channel-list"></div>
 
     <div id="profileEditor" class="panel profile-editor" hidden>
       <div class="row" style="align-items:center;">
@@ -170,11 +197,11 @@
     </div>
     <div class="panel">
       <h3>Chat</h3>
+      <div id="chatContext" class="small" style="margin-bottom:6px;"></div>
       <div id="chatLog"></div>
       <textarea id="message" rows="4" placeholder="type message"></textarea>
       <div class="row">
         <button id="send">Send DM</button>
-        <button id="pingBtn">Ping</button>
       </div>
     </div>
   </div>
@@ -195,12 +222,23 @@
   <div id="cardRefreshed"></div>
 </div>
 
+<div id="inviteEditor" class="panel invite-editor" hidden>
+  <div class="row" style="align-items:center;">
+    <h3 id="inviteTitle" style="margin:0; flex:1;">Invite</h3>
+    <button id="inviteClose" style="width:auto; padding:4px 8px;" title="Close">X</button>
+  </div>
+  <div id="inviteList" class="invite-list small"></div>
+  <button id="inviteSend">Send Invite</button>
+</div>
+
 <script>
 let since = 0;
 const infoEl = document.getElementById('info');
 const chatEl = document.getElementById('chatLog');
 const friendList = document.getElementById('friendList');
 const groupList = document.getElementById('groupList');
+const channelList = document.getElementById('channelList');
+const chatContext = document.getElementById('chatContext');
 const profileCard = document.getElementById('profileCard');
 const cardNickname = document.getElementById('cardNickname');
 const cardID = document.getElementById('cardID');
@@ -209,6 +247,9 @@ const cardRefreshed = document.getElementById('cardRefreshed');
 const profileEditor = document.getElementById('profileEditor');
 const friendEditor = document.getElementById('friendEditor');
 const presenceEditor = document.getElementById('presenceEditor');
+const inviteEditor = document.getElementById('inviteEditor');
+const inviteTitle = document.getElementById('inviteTitle');
+const inviteList = document.getElementById('inviteList');
 const profileIDCopy = document.getElementById('profileIDCopy');
 const friendsUserName = document.getElementById('friendsUserName');
 const presenceMode = document.getElementById('presenceMode');
@@ -220,7 +261,25 @@ document.getElementById('presenceFab').onclick = () => { presenceEditor.hidden =
 document.getElementById('presenceEditorClose').onclick = () => { presenceEditor.hidden = true; };
 document.getElementById('friendFab').onclick = () => { friendEditor.hidden = !friendEditor.hidden; };
 document.getElementById('friendEditorClose').onclick = () => { friendEditor.hidden = true; };
+document.getElementById('inviteClose').onclick = () => { inviteEditor.hidden = true; };
 let activeTarget = '';
+let activeGroup = '';
+let activeChannel = 'default';
+let latestGroups = [];
+let latestTargets = [];
+let inviteGroup = '';
+let inviteChannel = '';
+let persistContextTimer = null;
+
+function updateChatContext() {
+  if (activeGroup) {
+    chatContext.textContent = `group: ${activeGroup}/${activeChannel}`;
+    document.getElementById('send').textContent = 'Send Group';
+  } else {
+    chatContext.textContent = activeTarget ? `dm: ${activeTarget}` : 'dm: (select a friend)';
+    document.getElementById('send').textContent = 'Send DM';
+  }
+}
 
 function appendInfo(line) {
   infoEl.textContent += line + "\n";
@@ -259,6 +318,30 @@ function appendChat(ev) {
 
 function currentTarget() {
   return activeTarget;
+}
+
+function currentContextPayload() {
+  if (activeGroup) {
+    return {mode: 'group', group: activeGroup, channel: activeChannel || 'default'};
+  }
+  if (activeTarget) {
+    return {mode: 'dm', target: activeTarget};
+  }
+  return {};
+}
+
+async function persistContextNow() {
+  try {
+    await post('/api/context/set', currentContextPayload());
+  } catch (_) {}
+}
+
+function persistContextSoon() {
+  if (persistContextTimer) clearTimeout(persistContextTimer);
+  persistContextTimer = setTimeout(() => {
+    persistContextTimer = null;
+    persistContextNow();
+  }, 120);
 }
 
 async function post(url, body) {
@@ -352,15 +435,31 @@ async function openProfileCard(loginID) {
 }
 
 function renderTargets(targets, pendingFriends) {
+  latestTargets = Array.isArray(targets) ? targets : [];
+  let changed = false;
+  if (!activeGroup && activeTarget) {
+    const found = latestTargets.some((t) => (t.id || '') === activeTarget);
+    if (!found) {
+      activeTarget = '';
+      changed = true;
+    }
+  }
   friendList.innerHTML = '';
-  for (const t of targets || []) {
+  for (const t of latestTargets) {
     const row = document.createElement('div');
     row.style.padding = '6px 4px';
     row.style.borderBottom = '1px solid #25303b';
     row.style.wordBreak = 'break-all';
     row.style.overflowWrap = 'anywhere';
     row.style.cursor = 'pointer';
-    row.onclick = () => { activeTarget = t.id; };
+    if (activeTarget === t.id && !activeGroup) row.classList.add('sel-row');
+    row.onclick = () => {
+      activeTarget = t.id;
+      activeGroup = '';
+      activeChannel = 'default';
+      updateChatContext();
+      persistContextSoon();
+    };
 
     const name = document.createElement('div');
     name.textContent = t.label;
@@ -427,33 +526,159 @@ function renderTargets(targets, pendingFriends) {
   if ((targets || []).length === 0) {
     if (pending.length === 0) friendList.textContent = 'No friends/targets yet';
   }
-  if (!activeTarget && (targets || []).length > 0) activeTarget = targets[0].id || '';
+  if (!activeTarget && !activeGroup && (targets || []).length > 0) {
+    activeTarget = targets[0].id || '';
+    changed = true;
+  }
+  updateChatContext();
+  if (changed) persistContextSoon();
+}
+
+function openCreateServerDialog() {
+  const name = window.prompt('Server/Group name');
+  const group = (name || '').trim();
+  if (!group) return;
+  post('/api/group/create', {group, channel: 'default', public: true})
+    .then(async () => {
+      activeGroup = group;
+      activeChannel = 'default';
+      activeTarget = '';
+      updateChatContext();
+      await poll();
+      persistContextSoon();
+    })
+    .catch((e) => appendInfo(`group-create failed: ${e.message}`));
+}
+
+function openInviteDialog(group, channel) {
+  inviteGroup = (group || '').trim();
+  inviteChannel = (channel || 'default').trim() || 'default';
+  inviteTitle.textContent = `Invite to ${inviteGroup}/${inviteChannel}`;
+  inviteList.innerHTML = '';
+  const items = (latestTargets || []).filter((t) => t && t.id);
+  if (items.length === 0) {
+    inviteList.textContent = 'No friends available';
+  } else {
+    for (const t of items) {
+      const row = document.createElement('label');
+      row.className = 'chk-row';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.value = t.id;
+      const txt = document.createElement('span');
+      txt.textContent = `${t.label} (${t.id})`;
+      row.appendChild(cb);
+      row.appendChild(txt);
+      inviteList.appendChild(row);
+    }
+  }
+  inviteEditor.hidden = false;
 }
 
 function renderGroups(groups) {
+  latestGroups = Array.isArray(groups) ? groups : [];
+  let changed = false;
   groupList.innerHTML = '';
-  const items = groups || [];
+  const items = latestGroups;
   if (items.length === 0) {
-    groupList.textContent = 'No groups yet';
+    groupList.textContent = 'No servers joined yet';
+    channelList.textContent = 'No channels';
+    if (activeGroup || activeChannel !== 'default') changed = true;
+    activeGroup = '';
+    activeChannel = 'default';
+    updateChatContext();
+    if (changed) persistContextSoon();
     return;
+  }
+  const exists = items.some((g) => (g.name || '') === activeGroup);
+  if (!exists) {
+    activeGroup = items[0].name || '';
+    activeChannel = 'default';
+    changed = true;
   }
   for (const g of items) {
     const row = document.createElement('div');
-    row.style.padding = '6px 4px';
-    row.style.borderBottom = '1px solid #223040';
+    row.className = 'group-row';
+    if (activeGroup === (g.name || '')) row.classList.add('sel-row');
+    row.onclick = () => {
+      activeGroup = g.name || '';
+      activeChannel = 'default';
+      activeTarget = '';
+      renderGroups(latestGroups);
+      renderChannels();
+      updateChatContext();
+      persistContextSoon();
+    };
     const name = document.createElement('div');
-    name.style.fontWeight = '700';
+    name.className = 'group-name';
     name.textContent = g.name || '(group)';
     row.appendChild(name);
-    const channels = Array.isArray(g.channels) ? g.channels : [];
-    if (channels.length > 0) {
-      const sub = document.createElement('div');
-      sub.className = 'small';
-      sub.style.marginTop = '3px';
-      sub.textContent = channels.join(', ');
-      row.appendChild(sub);
-    }
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'row-icon-btn';
+    del.title = 'Remove';
+    del.textContent = '-';
+    del.onclick = async (ev) => {
+      ev.stopPropagation();
+      if (!window.confirm(`Remove server '${g.name || ''}' from this list?`)) return;
+      try {
+        await post('/api/group/remove', {group: g.name || ''});
+        await poll();
+        persistContextSoon();
+      } catch (e) { appendInfo(`group-remove failed: ${e.message}`); }
+    };
+    row.appendChild(del);
     groupList.appendChild(row);
+  }
+  const selected = latestGroups.find((x) => (x.name || '') === activeGroup);
+  document.getElementById('channelCreateBtn').hidden = !(selected && selected.owned);
+  renderChannels();
+  if (changed) persistContextSoon();
+}
+
+function renderChannels() {
+  channelList.innerHTML = '';
+  const g = latestGroups.find((x) => (x.name || '') === activeGroup);
+  const channels = g && Array.isArray(g.channels) ? g.channels : [];
+  if (!g) {
+    channelList.textContent = 'No channels';
+    return;
+  }
+  if (channels.length === 0) {
+    channelList.textContent = 'default';
+    if (activeChannel !== 'default') persistContextSoon();
+    activeChannel = 'default';
+    return;
+  }
+  if (!channels.includes(activeChannel)) {
+    activeChannel = channels[0];
+    persistContextSoon();
+  }
+  for (const ch of channels) {
+    const row = document.createElement('div');
+    row.className = 'group-row';
+    if (activeChannel === ch) row.classList.add('sel-row');
+    row.onclick = () => {
+      activeChannel = ch;
+      renderChannels();
+      updateChatContext();
+      persistContextSoon();
+    };
+    const name = document.createElement('div');
+    name.className = 'group-name';
+    name.textContent = ch;
+    row.appendChild(name);
+    const invite = document.createElement('button');
+    invite.type = 'button';
+    invite.className = 'row-icon-btn';
+    invite.title = 'Invite friends';
+    invite.textContent = 'Invite';
+    invite.onclick = (ev) => {
+      ev.stopPropagation();
+      openInviteDialog(activeGroup, ch);
+    };
+    row.appendChild(invite);
+    channelList.appendChild(row);
   }
 }
 
@@ -473,6 +698,19 @@ async function bootstrap() {
   document.getElementById('profileText').value = data.profile_text || '';
   renderTargets(data.targets || [], data.pending_friends || []);
   renderGroups(data.groups || []);
+  const last = data.last_context || {};
+  if (last.mode === 'group') {
+    activeGroup = (last.group || '').trim();
+    activeChannel = (last.channel || 'default').trim() || 'default';
+    activeTarget = '';
+  } else if (last.mode === 'dm') {
+    activeTarget = (last.target || '').trim();
+    activeGroup = '';
+    activeChannel = 'default';
+  }
+  renderTargets(latestTargets, data.pending_friends || []);
+  renderGroups(latestGroups);
+  updateChatContext();
   await post('/api/presence/check', {});
 }
 
@@ -502,21 +740,18 @@ setInterval(poll, 1000);
 bootstrap().then(poll);
 
 document.getElementById('send').onclick = async () => {
-  const to = currentTarget();
   const text = document.getElementById('message').value.trim();
-  if (!to || !text) return;
+  if (!text) return;
   try {
-    await post('/api/send', {to, text});
+    if (activeGroup) {
+      await post('/api/group/send', {group: activeGroup, channel: activeChannel, text});
+    } else {
+      const to = currentTarget();
+      if (!to) return;
+      await post('/api/send', {to, text});
+    }
     document.getElementById('message').value = '';
   } catch (e) { appendInfo(`send failed: ${e.message}`); }
-};
-
-document.getElementById('pingBtn').onclick = async () => {
-  const to = currentTarget();
-  if (!to) return;
-  try {
-    await post('/api/ping', {to});
-  } catch (e) { appendInfo(`ping failed: ${e.message}`); }
 };
 
 document.getElementById('message').addEventListener('keydown', async (ev) => {
@@ -524,12 +759,17 @@ document.getElementById('message').addEventListener('keydown', async (ev) => {
   if (ev.key !== 'Enter') return;
   if (ev.shiftKey) return;
   ev.preventDefault();
-  const to = currentTarget();
   const msgEl = document.getElementById('message');
   const text = msgEl.value.trim();
-  if (!to || !text) return;
+  if (!text) return;
   try {
-    await post('/api/send', {to, text});
+    if (activeGroup) {
+      await post('/api/group/send', {group: activeGroup, channel: activeChannel, text});
+    } else {
+      const to = currentTarget();
+      if (!to) return;
+      await post('/api/send', {to, text});
+    }
     msgEl.value = '';
   } catch (e) { appendInfo(`send failed: ${e.message}`); }
 });
@@ -541,6 +781,30 @@ document.getElementById('friendAdd').onclick = async () => {
     await post('/api/friend/add', {to});
     friendEditor.hidden = true;
   } catch (e) { appendInfo(`friend-add failed: ${e.message}`); }
+};
+
+document.getElementById('serverCreateBtn').onclick = openCreateServerDialog;
+
+document.getElementById('channelCreateBtn').onclick = async () => {
+  if (!activeGroup) return;
+  const name = window.prompt(`New channel name for ${activeGroup}`);
+  const channel = (name || '').trim();
+  if (!channel) return;
+  try {
+    await post('/api/group/create', {group: activeGroup, channel, public: true});
+    activeChannel = channel;
+    await poll();
+    persistContextSoon();
+  } catch (e) { appendInfo(`channel-create failed: ${e.message}`); }
+};
+
+document.getElementById('inviteSend').onclick = async () => {
+  const checked = Array.from(inviteList.querySelectorAll('input[type="checkbox"]:checked')).map((el) => el.value);
+  if (checked.length === 0) return;
+  try {
+    await post('/api/group/invite', {group: inviteGroup, channel: inviteChannel, to: checked});
+    inviteEditor.hidden = true;
+  } catch (e) { appendInfo(`group-invite failed: ${e.message}`); }
 };
 
 document.getElementById('saveProfile').onclick = async () => {
