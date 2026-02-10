@@ -9,6 +9,8 @@
     :root { --bg:#0d1217; --panel:#151d25; --text:#e6edf3; --muted:#8e9aa7; --accent:#55b2ff; --line:#263341; }
     body { margin:0; font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--bg); color:var(--text); }
     .wrap { width:100vw; height:100vh; margin:0; padding:10px; box-sizing:border-box; display:grid; grid-template-columns: minmax(280px, 320px) 1fr; gap:10px; }
+    .mode-dm #friendList { border-color:#78c8ff; box-shadow:0 0 0 1px rgba(120,200,255,.22) inset; }
+    .mode-group #groupList, .mode-group #channelList { border-color:#65d59c; box-shadow:0 0 0 1px rgba(101,213,156,.2) inset; }
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px; display:flex; flex-direction:column; min-height:0; }
     .left-panel { position:relative; padding-bottom:56px; }
     .right-col { display:grid; grid-template-rows: minmax(140px, 34%) 1fr; gap:12px; min-height:0; }
@@ -32,7 +34,19 @@
     .invite-list { max-height:32vh; overflow:auto; border:1px solid var(--line); border-radius:8px; padding:6px; margin:6px 0; }
     .chk-row { display:flex; align-items:center; gap:8px; padding:4px 2px; }
     .chk-row input { width:auto; margin:0; }
-    .sel-row { background:#0f1924; border-radius:6px; }
+    .friend-row { border-radius:8px; transition:background-color .12s ease, box-shadow .12s ease; }
+    .sel-row-dm {
+      background:linear-gradient(90deg, rgba(55,139,214,.38), rgba(20,31,43,.82));
+      box-shadow:inset 3px 0 0 #78c8ff, 0 0 0 1px rgba(120,200,255,.28);
+    }
+    .sel-row-group {
+      background:linear-gradient(90deg, rgba(68,166,123,.35), rgba(20,31,43,.82));
+      box-shadow:inset 3px 0 0 #65d59c, 0 0 0 1px rgba(101,213,156,.25);
+    }
+    .sel-row-channel {
+      background:linear-gradient(90deg, rgba(191,149,67,.34), rgba(20,31,43,.82));
+      box-shadow:inset 3px 0 0 #f0c46f, 0 0 0 1px rgba(240,196,111,.24);
+    }
     h3 { margin:0 0 8px; font-size:12px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase; }
     pre { margin:0; white-space:pre-wrap; word-wrap:break-word; overflow-wrap:anywhere; flex:1; min-height:0; overflow:auto; }
     input, textarea, button, select { width:100%; box-sizing:border-box; margin:4px 0; padding:7px 8px; border-radius:8px; border:1px solid #2d3c4b; background:#10171f; color:var(--text); }
@@ -126,7 +140,7 @@
   </style>
 </head>
 <body>
-<div class="wrap">
+<div id="mainWrap" class="wrap">
   <div class="panel left-panel">
     <h3 style="margin-top:12px">Friends: <span id="friendsUserName" class="friends-user"></span></h3>
     <div id="friendList" class="small friend-list"></div>
@@ -196,12 +210,11 @@
       <pre id="info"></pre>
     </div>
     <div class="panel">
-      <h3>Chat</h3>
-      <div id="chatContext" class="small" style="margin-bottom:6px;"></div>
+      <h3 id="chatTitle">Chat</h3>
       <div id="chatLog"></div>
       <textarea id="message" rows="4" placeholder="type message"></textarea>
       <div class="row">
-        <button id="send">Send DM</button>
+        <button id="send">Send</button>
       </div>
     </div>
   </div>
@@ -238,7 +251,7 @@ const chatEl = document.getElementById('chatLog');
 const friendList = document.getElementById('friendList');
 const groupList = document.getElementById('groupList');
 const channelList = document.getElementById('channelList');
-const chatContext = document.getElementById('chatContext');
+const chatTitle = document.getElementById('chatTitle');
 const profileCard = document.getElementById('profileCard');
 const cardNickname = document.getElementById('cardNickname');
 const cardID = document.getElementById('cardID');
@@ -248,6 +261,7 @@ const profileEditor = document.getElementById('profileEditor');
 const friendEditor = document.getElementById('friendEditor');
 const presenceEditor = document.getElementById('presenceEditor');
 const inviteEditor = document.getElementById('inviteEditor');
+const mainWrap = document.getElementById('mainWrap');
 const inviteTitle = document.getElementById('inviteTitle');
 const inviteList = document.getElementById('inviteList');
 const profileIDCopy = document.getElementById('profileIDCopy');
@@ -272,12 +286,19 @@ let inviteChannel = '';
 let persistContextTimer = null;
 
 function updateChatContext() {
+  mainWrap.classList.remove('mode-dm', 'mode-group');
   if (activeGroup) {
-    chatContext.textContent = `group: ${activeGroup}/${activeChannel}`;
-    document.getElementById('send').textContent = 'Send Group';
+    mainWrap.classList.add('mode-group');
+    chatTitle.textContent = `${activeGroup}/${activeChannel}`;
   } else {
-    chatContext.textContent = activeTarget ? `dm: ${activeTarget}` : 'dm: (select a friend)';
-    document.getElementById('send').textContent = 'Send DM';
+    mainWrap.classList.add('mode-dm');
+    if (!activeTarget) {
+      chatTitle.textContent = 'Select a friend to direct message';
+      return;
+    }
+    const t = (latestTargets || []).find((x) => (x.id || '') === activeTarget);
+    const label = (t && t.label) ? t.label : activeTarget;
+    chatTitle.textContent = `${label} direct message`;
   }
 }
 
@@ -447,12 +468,13 @@ function renderTargets(targets, pendingFriends) {
   friendList.innerHTML = '';
   for (const t of latestTargets) {
     const row = document.createElement('div');
+    row.className = 'friend-row';
     row.style.padding = '6px 4px';
     row.style.borderBottom = '1px solid #25303b';
     row.style.wordBreak = 'break-all';
     row.style.overflowWrap = 'anywhere';
     row.style.cursor = 'pointer';
-    if (activeTarget === t.id && !activeGroup) row.classList.add('sel-row');
+    if (activeTarget === t.id && !activeGroup) row.classList.add('sel-row-dm');
     row.onclick = () => {
       activeTarget = t.id;
       activeGroup = '';
@@ -469,9 +491,9 @@ function renderTargets(targets, pendingFriends) {
     name.style.overflowWrap = 'anywhere';
     name.style.wordBreak = 'break-word';
     const status = document.createElement('span');
-    const ttlLabel = (t.online_ttl_sec && t.online_ttl_sec > 0) ? ` ${t.online_ttl_sec}s` : '';
-    status.textContent = `${t.online || 'unknown'}${ttlLabel}`;
-    status.className = statusClass(t.online);
+    const state = (t.online === 'online') ? 'online' : 'offline';
+    status.textContent = state;
+    status.className = statusClass(state);
     const controls = document.createElement('div');
     controls.className = 'friend-controls';
     const info = document.createElement('button');
@@ -612,7 +634,7 @@ function renderGroups(groups) {
   for (const g of items) {
     const row = document.createElement('div');
     row.className = 'group-row';
-    if (activeGroup === (g.name || '')) row.classList.add('sel-row');
+    if (activeGroup === (g.name || '')) row.classList.add('sel-row-group');
     row.onclick = () => {
       activeGroup = g.name || '';
       activeChannel = 'default';
@@ -670,7 +692,7 @@ function renderChannels() {
   for (const ch of channels) {
     const row = document.createElement('div');
     row.className = 'group-row';
-    if (activeChannel === ch) row.classList.add('sel-row');
+    if (activeChannel === ch) row.classList.add('sel-row-channel');
     row.onclick = () => {
       activeChannel = ch;
       renderChannels();

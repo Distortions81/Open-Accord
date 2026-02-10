@@ -125,6 +125,13 @@ type panelTarget struct {
 	channel string
 }
 
+type pendingInvite struct {
+	From      string
+	Group     string
+	Channel   string
+	CreatedAt int64
+}
+
 const (
 	compressionNone           = "none"
 	compressionZlib           = "zlib"
@@ -169,6 +176,8 @@ type model struct {
 	presenceTTL       map[string]int
 	presenceVisible   bool
 	presenceTTLSec    int
+	groups            map[string]map[string]struct{}
+	pendingInvites    map[string]pendingInvite
 
 	infoEntries []string
 	chatEntries []uiEntry
@@ -224,6 +233,22 @@ func (m *model) addChatEntry(name string, body string, direct string, channel st
 		return
 	}
 	m.chatEntries = append(m.chatEntries, uiEntry{line: fmt.Sprintf("%s %s: %s", stamp(), name, body), direct: direct, channel: channel})
+}
+
+func groupChannelKey(group string, channel string) string {
+	return strings.TrimSpace(group) + "/" + strings.TrimSpace(channel)
+}
+
+func (m *model) rememberGroupChannel(group string, channel string) {
+	group = strings.TrimSpace(group)
+	channel = strings.TrimSpace(channel)
+	if group == "" || channel == "" {
+		return
+	}
+	if m.groups[group] == nil {
+		m.groups[group] = make(map[string]struct{})
+	}
+	m.groups[group][channel] = struct{}{}
 }
 
 func (m *model) displayPeer(loginID string) string {
@@ -350,6 +375,7 @@ func (m *model) commandNames() []string {
 		"/dm", "/identities", "/switchid",
 		"/nick", "/myname", "/profile", "/profile-get",
 		"/presence", "/presence-check",
+		"/servers", "/invites", "/invite-accept",
 		"/chat", "/chat-channel", "/panels", "/focus",
 		"/group", "/channel", "/clearctx", "/whoami",
 		"/friend-add", "/friend-accept",
@@ -580,6 +606,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		channelCtx := ""
 		if strings.TrimSpace(msg.pkt.Group) != "" && strings.TrimSpace(msg.pkt.Channel) != "" {
 			channelCtx = msg.pkt.Group + "/" + msg.pkt.Channel
+			m.rememberGroupChannel(msg.pkt.Group, msg.pkt.Channel)
 		}
 
 		switch msg.pkt.Type {
@@ -631,6 +658,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if looksLikeLoginID(other) && other != m.loginID {
 					m.friends[other] = struct{}{}
 				}
+			}
+			if msg.pkt.Type == "channel_invite" && strings.TrimSpace(msg.pkt.Group) != "" && strings.TrimSpace(msg.pkt.Channel) != "" {
+				key := groupChannelKey(msg.pkt.Group, msg.pkt.Channel)
+				m.pendingInvites[key] = pendingInvite{
+					From:      strings.TrimSpace(msg.pkt.From),
+					Group:     strings.TrimSpace(msg.pkt.Group),
+					Channel:   strings.TrimSpace(msg.pkt.Channel),
+					CreatedAt: time.Now().Unix(),
+				}
+				m.addInfoEntry(fmt.Sprintf("invite received: %s from %s (use /invite-accept %s)", key, m.displayPeer(msg.pkt.From), key))
 			}
 			line := fmt.Sprintf("[%s] from=%s to=%s", msg.pkt.Type, m.displayPeer(msg.pkt.From), m.displayPeer(msg.pkt.To))
 			if channelCtx != "" {
@@ -815,6 +852,11 @@ func (m *model) buildPanelChoices() (string, map[int]panelTarget) {
 	if m.group != "" && m.channel != "" {
 		channelSet[m.group+"/"+m.channel] = struct{}{}
 	}
+	for g, chs := range m.groups {
+		for ch := range chs {
+			channelSet[groupChannelKey(g, ch)] = struct{}{}
+		}
+	}
 	for _, e := range m.chatEntries {
 		if e.channel != "" {
 			channelSet[e.channel] = struct{}{}
@@ -934,6 +976,51 @@ func (m *model) presenceSummary(loginID string) string {
 	return "status=" + state
 }
 
+func (m *model) sortedInviteKeys() []string {
+	keys := make([]string, 0, len(m.pendingInvites))
+	for k := range m.pendingInvites {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (m *model) formatServers() string {
+	if len(m.groups) == 0 {
+		return "no known servers/channels"
+	}
+	groups := make([]string, 0, len(m.groups))
+	for g := range m.groups {
+		groups = append(groups, g)
+	}
+	sort.Strings(groups)
+	lines := []string{"servers/channels:"}
+	for _, g := range groups {
+		chs := make([]string, 0, len(m.groups[g]))
+		for ch := range m.groups[g] {
+			chs = append(chs, ch)
+		}
+		sort.Strings(chs)
+		lines = append(lines, "  "+g+": "+strings.Join(chs, ", "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) formatInvites() string {
+	keys := m.sortedInviteKeys()
+	if len(keys) == 0 {
+		return "no pending channel invites"
+	}
+	lines := []string{"pending channel invites:"}
+	for i, k := range keys {
+		inv := m.pendingInvites[k]
+		from := m.displayPeer(inv.From)
+		lines = append(lines, fmt.Sprintf("  %d) %s from %s", i+1, k, from))
+	}
+	lines = append(lines, "accept with /invite-accept <index|group/channel>")
+	return strings.Join(lines, "\n")
+}
+
 func (m *model) formatIdentityHelp() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -965,7 +1052,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 	}
 	switch parts[0] {
 	case "/help":
-		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /profile /profile-get /presence /presence-check /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
+		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /profile /profile-get /presence /presence-check /servers /invites /invite-accept /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
 	case "/to", "/use", "/chat", "/dm":
 		if parts[0] == "/dm" && len(parts) < 2 {
 			return logLine(m.formatDMList())
@@ -1006,6 +1093,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		}
 		m.group = strings.TrimSpace(parts[1])
 		m.channel = strings.TrimSpace(parts[2])
+		m.rememberGroupChannel(m.group, m.channel)
 		m.to = ""
 		m.applyFocus(panelTarget{mode: panelChannel, channel: m.group + "/" + m.channel})
 		return logLine("channel target set: " + m.group + "/" + m.channel)
@@ -1026,6 +1114,36 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		return logLine(m.formatContacts())
 	case "/friends":
 		return logLine(m.formatFriends())
+	case "/servers":
+		return logLine(m.formatServers())
+	case "/invites":
+		return logLine(m.formatInvites())
+	case "/invite-accept":
+		if len(parts) < 2 {
+			return logLine("usage: /invite-accept <index|group/channel>")
+		}
+		token := strings.TrimSpace(parts[1])
+		key := token
+		if idx, err := strconv.Atoi(token); err == nil {
+			keys := m.sortedInviteKeys()
+			if idx < 1 || idx > len(keys) {
+				return logLine("invite index out of range")
+			}
+			key = keys[idx-1]
+		}
+		inv, ok := m.pendingInvites[key]
+		if !ok {
+			return logLine("invite not found: " + key)
+		}
+		if err := m.sendSigned(Packet{Type: "channel_join", Group: inv.Group, Channel: inv.Channel}); err != nil {
+			return logLine("invite-accept error: " + err.Error())
+		}
+		delete(m.pendingInvites, key)
+		m.group = inv.Group
+		m.channel = inv.Channel
+		m.rememberGroupChannel(m.group, m.channel)
+		m.applyFocus(panelTarget{mode: panelChannel, channel: m.group + "/" + m.channel})
+		return logLine("invite accepted: " + key)
 	case "/identities":
 		return logLine(m.formatIdentityHelp())
 	case "/switchid":
@@ -1224,6 +1342,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		}
 		m.group = group
 		m.channel = channel
+		m.rememberGroupChannel(group, channel)
 		m.applyFocus(panelTarget{mode: panelChannel, channel: group + "/" + channel})
 		return logLine("channel created: " + group + "/" + channel + " (" + mode + ")")
 	case "/invite":
@@ -1252,6 +1371,8 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		}
 		m.group = group
 		m.channel = channel
+		m.rememberGroupChannel(group, channel)
+		delete(m.pendingInvites, groupChannelKey(group, channel))
 		m.applyFocus(panelTarget{mode: panelChannel, channel: group + "/" + channel})
 		return logLine("join requested: " + group + "/" + channel)
 	case "/channel-leave":

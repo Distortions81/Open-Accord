@@ -35,6 +35,9 @@ Optional flags:
 - `/profile-get <login_id|alias>`
 - `/presence <visible|invisible> [ttl_sec]`
 - `/presence-check [login_id|alias]`
+- `/servers`
+- `/invites`
+- `/invite-accept <index|group/channel>`
 - `/channel-create <group> <channel> <public|private>`
 - `/invite <login_id|alias>`
 - `/channel-join <group> <channel>`

@@ -98,6 +98,8 @@ func main() {
 		presenceTTL:     make(map[string]int),
 		presenceVisible: true,
 		presenceTTLSec:  defaultPresenceTTLSec,
+		groups:          make(map[string]map[string]struct{}),
+		pendingInvites:  make(map[string]pendingInvite),
 		group:           strings.TrimSpace(*group),
 		channel:         strings.TrimSpace(*channel),
 		historyIndex:    -1,
@@ -135,6 +137,7 @@ func main() {
 	}
 
 	if strings.TrimSpace(*group) != "" && strings.TrimSpace(*channel) != "" {
+		m.rememberGroupChannel(strings.TrimSpace(*group), strings.TrimSpace(*channel))
 		m.applyFocus(panelTarget{mode: panelChannel, channel: strings.TrimSpace(*group) + "/" + strings.TrimSpace(*channel)})
 	}
 
