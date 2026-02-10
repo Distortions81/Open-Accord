@@ -70,6 +70,13 @@ type Packet struct {
 	MaxMsgsPerSec int      `json:"max_msgs_per_sec,omitempty"`
 	Burst         int      `json:"burst,omitempty"`
 	Caps          []string `json:"caps,omitempty"`
+	CreatedAt     int64    `json:"created_at,omitempty"`
+	Hops          []hopRef `json:"hops,omitempty"`
+}
+
+type hopRef struct {
+	Node string `json:"node"`
+	TS   int64  `json:"ts"`
 }
 
 type profilePayload struct {
@@ -119,6 +126,7 @@ type signedAction struct {
 	Group       string `json:"group,omitempty"`
 	Channel     string `json:"channel,omitempty"`
 	Public      bool   `json:"public,omitempty"`
+	CreatedAt   int64  `json:"created_at,omitempty"`
 }
 
 type keyFile struct {
@@ -731,7 +739,7 @@ func verifyServerIdentity(serverID, pubKeyB64, sigB64 string) bool {
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public, CreatedAt: p.CreatedAt})
 	if err != nil {
 		return "", err
 	}
@@ -751,7 +759,7 @@ func verifyActionSignature(p Packet) bool {
 	if err != nil || len(sigRaw) != ed25519.SignatureSize {
 		return false
 	}
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public, CreatedAt: p.CreatedAt})
 	if err != nil {
 		return false
 	}
@@ -1091,7 +1099,7 @@ func (s *Server) isUserOnline(loginID string) bool {
 
 func isSignedActionType(typ string) bool {
 	switch typ {
-	case "send", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get", "presence_keepalive":
+	case "send", "ping", "pong", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get", "presence_keepalive":
 		return true
 	default:
 		return false
@@ -1105,6 +1113,8 @@ func validateSignedActionPacket(p Packet) bool {
 	switch p.Type {
 	case "send":
 		return strings.TrimSpace(p.To) != "" && strings.TrimSpace(p.Body) != ""
+	case "ping", "pong":
+		return strings.TrimSpace(p.To) != ""
 	case "friend_add", "friend_accept":
 		return strings.TrimSpace(p.To) != ""
 	case "channel_create":
@@ -1124,6 +1134,12 @@ func validateSignedActionPacket(p Packet) bool {
 	default:
 		return false
 	}
+}
+
+func (s *Server) withHop(p Packet) Packet {
+	out := p
+	out.Hops = append(append([]hopRef{}, p.Hops...), hopRef{Node: s.id, TS: time.Now().UnixMilli()})
+	return out
 }
 
 func clampPresenceTTLSec(ttl int) int {
@@ -1362,7 +1378,7 @@ func (s *Server) handleChannelSend(p Packet) {
 	s.mu.RUnlock()
 
 	for _, member := range members {
-		s.notifyUserOrQueue(Packet{Type: "channel_deliver", ID: p.ID, From: p.From, To: member, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+		s.notifyUserOrQueue(Packet{Type: "channel_deliver", ID: p.ID, From: p.From, To: member, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig, CreatedAt: p.CreatedAt, Hops: p.Hops})
 	}
 }
 
@@ -1452,10 +1468,14 @@ func (s *Server) processSignedAction(p Packet) {
 	switch p.Type {
 	case "send":
 		s.maybeRememberTopology(p)
-		delivered := s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+		delivered := s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig, CreatedAt: p.CreatedAt, Hops: p.Hops})
 		if !delivered {
 			s.maybeQueueForHostedUser(p)
 		}
+	case "ping":
+		s.notifyUserOrQueue(Packet{Type: "ping", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig, CreatedAt: p.CreatedAt, Hops: p.Hops})
+	case "pong":
+		s.notifyUserOrQueue(Packet{Type: "pong", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig, CreatedAt: p.CreatedAt, Hops: p.Hops})
 	case "friend_add":
 		s.handleFriendAdd(p)
 	case "friend_accept":
@@ -1686,10 +1706,10 @@ func (s *Server) handleUserPacket(sender string, p Packet) {
 		local.Compression = compressionNone
 		local.USize = 0
 	}
-
-	s.processSignedAction(local)
+	stamped := s.withHop(local)
+	s.processSignedAction(stamped)
 	if s.relayEnabled {
-		s.floodToPeers("", p)
+		s.floodToPeers("", s.withHop(p))
 	}
 }
 
@@ -1780,9 +1800,10 @@ func (s *Server) handlePeerPacket(fromPeer, peerAddr string, c *Conn, p Packet) 
 			local.Compression = compressionNone
 			local.USize = 0
 		}
-		s.processSignedAction(local)
+		stamped := s.withHop(local)
+		s.processSignedAction(stamped)
 		if s.relayEnabled {
-			s.floodToPeers(fromPeer, p)
+			s.floodToPeers(fromPeer, s.withHop(p))
 		}
 		return true
 	}

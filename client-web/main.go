@@ -32,21 +32,28 @@ import (
 )
 
 type Packet struct {
-	Type        string `json:"type"`
-	Role        string `json:"role,omitempty"`
-	ID          string `json:"id,omitempty"`
-	From        string `json:"from,omitempty"`
-	To          string `json:"to,omitempty"`
-	Body        string `json:"body,omitempty"`
-	Compression string `json:"compression,omitempty"`
-	USize       int    `json:"usize,omitempty"`
-	Group       string `json:"group,omitempty"`
-	Channel     string `json:"channel,omitempty"`
-	Public      bool   `json:"public,omitempty"`
-	Origin      string `json:"origin,omitempty"`
-	Nonce       string `json:"nonce,omitempty"`
-	PubKey      string `json:"pub_key,omitempty"`
-	Sig         string `json:"sig,omitempty"`
+	Type        string   `json:"type"`
+	Role        string   `json:"role,omitempty"`
+	ID          string   `json:"id,omitempty"`
+	From        string   `json:"from,omitempty"`
+	To          string   `json:"to,omitempty"`
+	Body        string   `json:"body,omitempty"`
+	Compression string   `json:"compression,omitempty"`
+	USize       int      `json:"usize,omitempty"`
+	Group       string   `json:"group,omitempty"`
+	Channel     string   `json:"channel,omitempty"`
+	Public      bool     `json:"public,omitempty"`
+	Origin      string   `json:"origin,omitempty"`
+	Nonce       string   `json:"nonce,omitempty"`
+	PubKey      string   `json:"pub_key,omitempty"`
+	Sig         string   `json:"sig,omitempty"`
+	CreatedAt   int64    `json:"created_at,omitempty"`
+	Hops        []hopRef `json:"hops,omitempty"`
+}
+
+type hopRef struct {
+	Node string `json:"node"`
+	TS   int64  `json:"ts"`
 }
 
 type signedAction struct {
@@ -60,6 +67,7 @@ type signedAction struct {
 	Group       string `json:"group,omitempty"`
 	Channel     string `json:"channel,omitempty"`
 	Public      bool   `json:"public,omitempty"`
+	CreatedAt   int64  `json:"created_at,omitempty"`
 }
 
 type keyFile struct {
@@ -174,6 +182,7 @@ type webClient struct {
 	friends          map[string]struct{}
 	pendingFriends   map[string]int64
 	groups           map[string]map[string]struct{}
+	pendingPings     map[string]int64
 
 	events  []webEvent
 	nextSeq int64
@@ -267,14 +276,17 @@ func (c *webClient) nextMessageID() string {
 	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), n)
 }
 
-func (c *webClient) sendSigned(p Packet) error {
+func (c *webClient) sendSignedWithID(p Packet) (string, error) {
 	p.ID = c.nextMessageID()
 	p.From = c.loginID
 	p.PubKey = c.pubB64
+	if p.CreatedAt <= 0 {
+		p.CreatedAt = time.Now().UnixMilli()
+	}
 	if strings.TrimSpace(p.Body) != "" {
 		body, comp, usize, err := encodeBodyForSend(p.Body)
 		if err != nil {
-			return err
+			return "", err
 		}
 		p.Body = body
 		p.Compression = comp
@@ -282,12 +294,20 @@ func (c *webClient) sendSigned(p Packet) error {
 	}
 	sig, err := signAction(c.priv, p)
 	if err != nil {
-		return err
+		return "", err
 	}
 	p.Sig = sig
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.enc.Encode(p)
+	if err := c.enc.Encode(p); err != nil {
+		return "", err
+	}
+	return p.ID, nil
+}
+
+func (c *webClient) sendSigned(p Packet) error {
+	_, err := c.sendSignedWithID(p)
+	return err
 }
 
 func (c *webClient) requestProfile(target string) {
@@ -421,6 +441,35 @@ func (c *webClient) rememberGroup(group string, channel string) {
 	c.mu.Unlock()
 }
 
+func messageMeta(p Packet) string {
+	parts := make([]string, 0, 3)
+	if p.CreatedAt > 0 {
+		age := time.Now().UnixMilli() - p.CreatedAt
+		if age >= 0 {
+			parts = append(parts, fmt.Sprintf("age=%dms", age))
+		}
+	}
+	if len(p.Hops) > 0 {
+		nodes := make([]string, 0, len(p.Hops))
+		for _, h := range p.Hops {
+			node := strings.TrimSpace(h.Node)
+			if node == "" {
+				continue
+			}
+			if i := strings.LastIndex(node, ":"); i >= 0 && i+1 < len(node) {
+				node = node[i+1:]
+			}
+			nodes = append(nodes, node)
+		}
+		if len(nodes) > 0 {
+			parts = append(parts, fmt.Sprintf("hops=%d(%s)", len(nodes), strings.Join(nodes, "->")))
+		} else {
+			parts = append(parts, fmt.Sprintf("hops=%d", len(p.Hops)))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
 func (c *webClient) networkLoop(ch <-chan netMsg) {
 	for ev := range ch {
 		if ev.err != nil {
@@ -440,8 +489,46 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				line = fmt.Sprintf("[%s/%s] %s", p.Group, p.Channel, line)
 			}
 			c.addEventWithActor("chat", line, p.From)
+			if meta := messageMeta(p); meta != "" {
+				c.addEvent("info", fmt.Sprintf("msg from=%s %s", c.displayPeer(p.From), meta))
+			}
 			if p.Origin != "" {
 				c.addEvent("info", "message via "+p.Origin)
+			}
+		case "ping":
+			if meta := messageMeta(p); meta != "" {
+				c.addEvent("info", fmt.Sprintf("ping from=%s %s", c.displayPeer(p.From), meta))
+			} else {
+				c.addEvent("info", fmt.Sprintf("ping from=%s", c.displayPeer(p.From)))
+			}
+			replyBody, _ := json.Marshal(map[string]any{"ping_id": p.ID, "ping_created_at": p.CreatedAt})
+			_ = c.sendSigned(Packet{Type: "pong", To: p.From, Body: string(replyBody)})
+		case "pong":
+			var payload struct {
+				PingID        string `json:"ping_id"`
+				PingCreatedAt int64  `json:"ping_created_at"`
+			}
+			_ = json.Unmarshal([]byte(strings.TrimSpace(p.Body)), &payload)
+			rtt := int64(0)
+			if strings.TrimSpace(payload.PingID) != "" {
+				c.mu.Lock()
+				if sent, ok := c.pendingPings[payload.PingID]; ok {
+					rtt = time.Now().UnixMilli() - sent
+					delete(c.pendingPings, payload.PingID)
+				}
+				c.mu.Unlock()
+			}
+			meta := messageMeta(p)
+			if rtt > 0 {
+				if meta != "" {
+					meta += " "
+				}
+				meta += fmt.Sprintf("rtt=%dms", rtt)
+			}
+			if meta != "" {
+				c.addEvent("info", fmt.Sprintf("pong from=%s %s", c.displayPeer(p.From), meta))
+			} else {
+				c.addEvent("info", fmt.Sprintf("pong from=%s", c.displayPeer(p.From)))
 			}
 		case "friend_request":
 			if p.To == c.loginID && looksLikeLoginID(p.From) {
@@ -714,6 +801,31 @@ func (c *webClient) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	c.addEventWithActor("chat", text, c.loginID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (c *webClient) handlePing(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		To string `json:"to"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	target, ok := c.resolveRecipient(req.To)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown recipient"})
+		return
+	}
+	id, err := c.sendSignedWithID(Packet{Type: "ping", To: target, Body: "ping"})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.mu.Lock()
+	c.pendingPings[id] = time.Now().UnixMilli()
+	c.mu.Unlock()
+	c.addEvent("info", "ping sent to "+c.displayPeer(target))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id})
 }
 
 func (c *webClient) handleFriendAdd(w http.ResponseWriter, r *http.Request) {
@@ -1260,7 +1372,7 @@ func loadOrCreateKey(path string) (ed25519.PrivateKey, error) {
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public, CreatedAt: p.CreatedAt})
 	if err != nil {
 		return "", err
 	}
@@ -1573,6 +1685,7 @@ func main() {
 		friends:          make(map[string]struct{}),
 		pendingFriends:   make(map[string]int64),
 		groups:           make(map[string]map[string]struct{}),
+		pendingPings:     make(map[string]int64),
 	}
 	client.addEvent("info", "connected to "+*serverAddr)
 	client.addEvent("info", "login_id: "+loginID)
@@ -1612,6 +1725,7 @@ func main() {
 	mux.HandleFunc("/api/targets", client.handleTargets)
 	mux.HandleFunc("/api/groups", client.handleGroups)
 	mux.HandleFunc("/api/send", client.handleSend)
+	mux.HandleFunc("/api/ping", client.handlePing)
 	mux.HandleFunc("/api/friend/add", client.handleFriendAdd)
 	mux.HandleFunc("/api/friend/accept", client.handleFriendAccept)
 	mux.HandleFunc("/api/friend/ignore", client.handleFriendIgnore)

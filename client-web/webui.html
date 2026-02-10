@@ -172,7 +172,10 @@
       <h3>Chat</h3>
       <div id="chatLog"></div>
       <textarea id="message" rows="4" placeholder="type message"></textarea>
-      <button id="send">Send DM</button>
+      <div class="row">
+        <button id="send">Send DM</button>
+        <button id="pingBtn">Ping</button>
+      </div>
     </div>
   </div>
 </div>
@@ -506,6 +509,14 @@ document.getElementById('send').onclick = async () => {
     await post('/api/send', {to, text});
     document.getElementById('message').value = '';
   } catch (e) { appendInfo(`send failed: ${e.message}`); }
+};
+
+document.getElementById('pingBtn').onclick = async () => {
+  const to = currentTarget();
+  if (!to) return;
+  try {
+    await post('/api/ping', {to});
+  } catch (e) { appendInfo(`ping failed: ${e.message}`); }
 };
 
 document.getElementById('message').addEventListener('keydown', async (ev) => {
