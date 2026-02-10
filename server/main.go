@@ -46,6 +46,7 @@ type Packet struct {
 	Body          string   `json:"body,omitempty"`
 	Group         string   `json:"group,omitempty"`
 	Channel       string   `json:"channel,omitempty"`
+	Public        bool     `json:"public,omitempty"`
 	Origin        string   `json:"origin,omitempty"`
 	Nonce         string   `json:"nonce,omitempty"`
 	PubKey        string   `json:"pub_key,omitempty"`
@@ -71,11 +72,14 @@ func (c *Conn) Send(p Packet) error {
 }
 
 type signedAction struct {
-	Type string `json:"type"`
-	ID   string `json:"id"`
-	From string `json:"from"`
-	To   string `json:"to,omitempty"`
-	Body string `json:"body,omitempty"`
+	Type    string `json:"type"`
+	ID      string `json:"id"`
+	From    string `json:"from"`
+	To      string `json:"to,omitempty"`
+	Body    string `json:"body,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Channel string `json:"channel,omitempty"`
+	Public  bool   `json:"public,omitempty"`
 }
 
 type keyFile struct {
@@ -96,6 +100,13 @@ type rateLimiter struct {
 	burst  float64
 	tokens float64
 	last   time.Time
+}
+
+type ChannelState struct {
+	Owner   string
+	Public  bool
+	Members map[string]struct{}
+	Invites map[string]string
 }
 
 func newRateLimiter(msgsPerSec int, burst int) *rateLimiter {
@@ -156,6 +167,9 @@ type Server struct {
 	peerBanned   map[string]time.Time
 	peerBanScore int
 	peerBanFor   time.Duration
+	friends      map[string]map[string]struct{}
+	friendAdds   map[string]map[string]struct{}
+	channels     map[string]*ChannelState
 
 	counter atomic.Uint64
 }
@@ -207,6 +221,9 @@ func NewServer(id, ownerPubKeyB64 string, ownerPriv ed25519.PrivateKey, advertis
 		peerBanned:      make(map[string]time.Time),
 		peerBanScore:    defaultPeerBanScore,
 		peerBanFor:      defaultPeerBanFor,
+		friends:         make(map[string]map[string]struct{}),
+		friendAdds:      make(map[string]map[string]struct{}),
+		channels:        make(map[string]*ChannelState),
 	}
 }
 
@@ -406,7 +423,7 @@ func verifyServerIdentity(serverID, pubKeyB64, sigB64 string) bool {
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Public: p.Public})
 	if err != nil {
 		return "", err
 	}
@@ -426,7 +443,7 @@ func verifyActionSignature(p Packet) bool {
 	if err != nil || len(sigRaw) != ed25519.SignatureSize {
 		return false
 	}
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Public: p.Public})
 	if err != nil {
 		return false
 	}
@@ -744,6 +761,254 @@ func (s *Server) sendToUser(to string, p Packet) bool {
 	return true
 }
 
+func isSignedActionType(typ string) bool {
+	switch typ {
+	case "send", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateSignedActionPacket(p Packet) bool {
+	if strings.TrimSpace(p.ID) == "" || strings.TrimSpace(p.From) == "" {
+		return false
+	}
+	switch p.Type {
+	case "send":
+		return strings.TrimSpace(p.To) != "" && strings.TrimSpace(p.Body) != ""
+	case "friend_add", "friend_accept":
+		return strings.TrimSpace(p.To) != ""
+	case "channel_create":
+		return strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != ""
+	case "channel_invite":
+		return strings.TrimSpace(p.To) != "" && strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != ""
+	case "channel_join", "channel_leave":
+		return strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != ""
+	case "channel_send":
+		return strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" && strings.TrimSpace(p.Body) != ""
+	default:
+		return false
+	}
+}
+
+func channelKey(group string, channel string) string {
+	return strings.TrimSpace(group) + "/" + strings.TrimSpace(channel)
+}
+
+func (s *Server) isFriend(a, b string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	links := s.friends[a]
+	if links == nil {
+		return false
+	}
+	_, ok := links[b]
+	return ok
+}
+
+func (s *Server) addFriendEdgeLocked(a, b string) {
+	if s.friends[a] == nil {
+		s.friends[a] = make(map[string]struct{})
+	}
+	s.friends[a][b] = struct{}{}
+}
+
+func (s *Server) notifyUserOrQueue(p Packet) {
+	if strings.TrimSpace(p.To) == "" {
+		return
+	}
+	if s.sendToUser(p.To, p) {
+		return
+	}
+	if p.Type != "deliver" && p.Type != "channel_deliver" {
+		return
+	}
+	s.maybeQueueForHostedUser(Packet{ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, PubKey: p.PubKey, Sig: p.Sig})
+}
+
+func (s *Server) handleFriendAdd(p Packet) {
+	if p.From == p.To {
+		return
+	}
+	s.mu.Lock()
+	if s.friendAdds[p.From] == nil {
+		s.friendAdds[p.From] = make(map[string]struct{})
+	}
+	s.friendAdds[p.From][p.To] = struct{}{}
+	_, reverseExists := s.friendAdds[p.To][p.From]
+	if reverseExists {
+		s.addFriendEdgeLocked(p.From, p.To)
+		s.addFriendEdgeLocked(p.To, p.From)
+		delete(s.friendAdds[p.From], p.To)
+		delete(s.friendAdds[p.To], p.From)
+	}
+	s.mu.Unlock()
+
+	if reverseExists {
+		s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.From, To: p.To, Body: "friends"})
+		s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.To, To: p.From, Body: "friends"})
+		return
+	}
+	s.notifyUserOrQueue(Packet{Type: "friend_request", From: p.From, To: p.To, Body: "friend request"})
+}
+
+func (s *Server) handleFriendAccept(p Packet) {
+	if p.From == p.To {
+		return
+	}
+	s.mu.Lock()
+	_, pending := s.friendAdds[p.To][p.From]
+	if pending {
+		s.addFriendEdgeLocked(p.From, p.To)
+		s.addFriendEdgeLocked(p.To, p.From)
+		delete(s.friendAdds[p.To], p.From)
+	}
+	s.mu.Unlock()
+	if !pending {
+		s.handleFriendAdd(Packet{From: p.From, To: p.To})
+		return
+	}
+	s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.From, To: p.To, Body: "friends"})
+	s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.To, To: p.From, Body: "friends"})
+}
+
+func (s *Server) handleChannelCreate(p Packet) {
+	key := channelKey(p.Group, p.Channel)
+	if key == "/" {
+		return
+	}
+	s.mu.Lock()
+	ch := s.channels[key]
+	if ch == nil {
+		ch = &ChannelState{Owner: p.From, Public: p.Public, Members: make(map[string]struct{}), Invites: make(map[string]string)}
+		s.channels[key] = ch
+	}
+	ch.Members[p.From] = struct{}{}
+	if p.Public {
+		ch.Public = true
+	}
+	publicChannel := ch.Public
+	s.mu.Unlock()
+	s.notifyUserOrQueue(Packet{Type: "channel_update", From: p.From, To: p.From, Group: p.Group, Channel: p.Channel, Public: publicChannel, Body: "created"})
+}
+
+func (s *Server) handleChannelInvite(p Packet) {
+	if p.From == p.To {
+		return
+	}
+	key := channelKey(p.Group, p.Channel)
+	s.mu.Lock()
+	ch := s.channels[key]
+	if ch == nil {
+		s.mu.Unlock()
+		return
+	}
+	_, inviterIsMember := ch.Members[p.From]
+	canInvite := ch.Public || inviterIsMember
+	if !ch.Public && inviterIsMember && p.From != ch.Owner {
+		links := s.friends[p.From]
+		if links == nil {
+			canInvite = false
+		} else if _, ok := links[p.To]; !ok {
+			canInvite = false
+		}
+	}
+	if canInvite {
+		ch.Invites[p.To] = p.From
+	}
+	publicChannel := ch.Public
+	s.mu.Unlock()
+	if !canInvite {
+		return
+	}
+	s.notifyUserOrQueue(Packet{Type: "channel_invite", From: p.From, To: p.To, Group: p.Group, Channel: p.Channel, Public: publicChannel, Body: "invite"})
+}
+
+func (s *Server) handleChannelJoin(p Packet) {
+	key := channelKey(p.Group, p.Channel)
+	s.mu.Lock()
+	ch := s.channels[key]
+	if ch == nil {
+		s.mu.Unlock()
+		return
+	}
+	_, member := ch.Members[p.From]
+	_, invited := ch.Invites[p.From]
+	if member || ch.Public || invited {
+		ch.Members[p.From] = struct{}{}
+		delete(ch.Invites, p.From)
+		publicChannel := ch.Public
+		s.mu.Unlock()
+		s.notifyUserOrQueue(Packet{Type: "channel_joined", From: p.From, To: p.From, Group: p.Group, Channel: p.Channel, Public: publicChannel, Body: "joined"})
+		return
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) handleChannelLeave(p Packet) {
+	key := channelKey(p.Group, p.Channel)
+	s.mu.Lock()
+	ch := s.channels[key]
+	if ch != nil {
+		delete(ch.Members, p.From)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) handleChannelSend(p Packet) {
+	key := channelKey(p.Group, p.Channel)
+	s.mu.RLock()
+	ch := s.channels[key]
+	if ch == nil {
+		s.mu.RUnlock()
+		return
+	}
+	if _, ok := ch.Members[p.From]; !ok {
+		s.mu.RUnlock()
+		return
+	}
+	members := make([]string, 0, len(ch.Members))
+	for m := range ch.Members {
+		members = append(members, m)
+	}
+	s.mu.RUnlock()
+
+	for _, member := range members {
+		s.notifyUserOrQueue(Packet{Type: "channel_deliver", ID: p.ID, From: p.From, To: member, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+	}
+}
+
+func (s *Server) processSignedAction(p Packet) {
+	switch p.Type {
+	case "send":
+		s.maybeRememberTopology(p)
+		delivered := s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+		if !delivered {
+			s.maybeQueueForHostedUser(p)
+		}
+	case "friend_add":
+		s.handleFriendAdd(p)
+	case "friend_accept":
+		s.handleFriendAccept(p)
+	case "channel_create":
+		s.maybeRememberTopology(p)
+		s.handleChannelCreate(p)
+	case "channel_invite":
+		s.maybeRememberTopology(p)
+		s.handleChannelInvite(p)
+	case "channel_join":
+		s.maybeRememberTopology(p)
+		s.handleChannelJoin(p)
+	case "channel_leave":
+		s.maybeRememberTopology(p)
+		s.handleChannelLeave(p)
+	case "channel_send":
+		s.maybeRememberTopology(p)
+		s.handleChannelSend(p)
+	}
+}
+
 func (s *Server) maybeRememberTopology(p Packet) {
 	if s.persistenceMode != persistenceModePersist || s.store == nil {
 		return
@@ -920,13 +1185,13 @@ func (s *Server) handleUser(loginID string, c *Conn, reader *bufio.Reader, rl *r
 }
 
 func (s *Server) handleUserPacket(sender string, p Packet) {
-	if p.Type != "send" {
-		return
-	}
-	if strings.TrimSpace(p.ID) == "" || strings.TrimSpace(p.From) == "" || strings.TrimSpace(p.To) == "" || strings.TrimSpace(p.Body) == "" {
+	if !isSignedActionType(p.Type) {
 		return
 	}
 	if p.From != sender {
+		return
+	}
+	if !validateSignedActionPacket(p) {
 		return
 	}
 	if !verifyActionSignature(p) {
@@ -936,11 +1201,7 @@ func (s *Server) handleUserPacket(sender string, p Packet) {
 		return
 	}
 
-	s.maybeRememberTopology(p)
-	delivered := s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
-	if !delivered {
-		s.maybeQueueForHostedUser(p)
-	}
+	s.processSignedAction(p)
 	if s.relayEnabled {
 		s.floodToPeers("", p)
 	}
@@ -990,31 +1251,6 @@ func (s *Server) handlePeer(peerID, peerAddr string, c *Conn, reader *bufio.Read
 
 func (s *Server) handlePeerPacket(fromPeer, peerAddr string, c *Conn, p Packet) bool {
 	switch p.Type {
-	case "send":
-		if strings.TrimSpace(p.ID) == "" || strings.TrimSpace(p.From) == "" || strings.TrimSpace(p.To) == "" || strings.TrimSpace(p.Body) == "" {
-			if s.penalizePeer(peerAddr, 2, "malformed send packet") {
-				return false
-			}
-			return true
-		}
-		if !verifyActionSignature(p) {
-			if s.penalizePeer(peerAddr, 5, "invalid message signature") {
-				return false
-			}
-			return true
-		}
-		if !s.markSeen(p.ID) {
-			return true
-		}
-		s.maybeRememberTopology(p)
-		delivered := s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
-		if !delivered {
-			s.maybeQueueForHostedUser(p)
-		}
-		if s.relayEnabled {
-			s.floodToPeers(fromPeer, p)
-		}
-		return true
 	case "getaddr":
 		s.sendAddr(c)
 		return true
@@ -1024,8 +1260,30 @@ func (s *Server) handlePeerPacket(fromPeer, peerAddr string, c *Conn, p Packet) 
 		}
 		return true
 	default:
-		if s.penalizePeer(peerAddr, 1, "unknown packet type") {
-			return false
+		if !isSignedActionType(p.Type) {
+			if s.penalizePeer(peerAddr, 1, "unknown packet type") {
+				return false
+			}
+			return true
+		}
+		if !validateSignedActionPacket(p) {
+			if s.penalizePeer(peerAddr, 2, "malformed signed packet") {
+				return false
+			}
+			return true
+		}
+		if !verifyActionSignature(p) {
+			if s.penalizePeer(peerAddr, 5, "invalid signed packet signature") {
+				return false
+			}
+			return true
+		}
+		if !s.markSeen(p.ID) {
+			return true
+		}
+		s.processSignedAction(p)
+		if s.relayEnabled {
+			s.floodToPeers(fromPeer, p)
 		}
 		return true
 	}

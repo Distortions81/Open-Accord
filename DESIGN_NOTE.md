@@ -60,7 +60,7 @@ Phase: Live-only mesh by default, with optional persistence mode.
 - Persistence remains local policy only, not a global authority.
 
 ## Routing Model
-- Servers relay messages across peers.
+- Servers relay signed actions (messages, friend actions, channel actions) across peers.
 - Message IDs are deduped to prevent loops.
 - Delivery is best-effort to currently connected recipients.
 - In persistence mode, hosted offline recipients can receive store-and-forward replay.
@@ -69,7 +69,10 @@ Phase: Live-only mesh by default, with optional persistence mode.
 - Groups are user-created.
 - Channels exist inside groups.
 - Current transport supports `group` and `channel` message labels.
-- Full group/channel authorization and role policy are later work.
+- Current supports channel membership, public/private channel creation, invites, join/leave, and channel fanout.
+- Public channels allow any authenticated user to invite any user.
+- Private channels require inviter membership; non-owner member invites require inviter-friendship with invitee.
+- Full role model (owner/admin/moderator ACLs) is later work.
 
 ## Protocol Shape (Current)
 - Auth flow:

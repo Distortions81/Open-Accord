@@ -9,24 +9,36 @@ Interactive terminal UI client for GoAccord.
 
 ## Run
 ```bash
-go run ./client-tui -addr 127.0.0.1:9000
+go run ./client-tui -addr 127.0.0.1:9101
 ```
 
 Optional flags:
 - `-key <path>`: client private key file
-- `-to <login_id>`: initial recipient
+- `-contacts <path>`: contacts file (default `~/.goaccord/contacts.json`)
+- `-to <login_id|alias>`: initial recipient
 - `-group <name>`: initial group label
 - `-channel <name>`: initial channel label
 
 ## Commands
 - `/help`
-- `/to <login_id>`
+- `/to <login_id|alias>`
+- `/use <login_id|alias>`
+- `/contacts`
+- `/remove-contact <alias>`
 - `/group <name>`
 - `/channel <name>`
 - `/clearctx`
 - `/whoami`
+- `/friend-add <login_id|alias>`
+- `/friend-accept <login_id|alias>`
+- `/channel-create <group> <channel> <public|private>`
+- `/invite <login_id|alias>`
+- `/channel-join <group> <channel>`
+- `/channel-leave <group> <channel>`
+- `/channel-send <text>`
 - `/quit`
 
-## Notes
-- Messages are signed with the same payload shape expected by the server.
-- `group/channel` are currently labels on `send`/`deliver` packets.
+## Contacts behavior
+- Contacts are created automatically when you interact with a `login_id` or receive packets from a user.
+- Aliases default to short login-id prefixes; collisions get suffixes (`-2`, `-3`, ...).
+- Use `/remove-contact <alias>` to delete.

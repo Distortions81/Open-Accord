@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,7 @@ type Packet struct {
 	Body    string `json:"body,omitempty"`
 	Group   string `json:"group,omitempty"`
 	Channel string `json:"channel,omitempty"`
+	Public  bool   `json:"public,omitempty"`
 	Origin  string `json:"origin,omitempty"`
 	Nonce   string `json:"nonce,omitempty"`
 	PubKey  string `json:"pub_key,omitempty"`
@@ -38,15 +40,27 @@ type Packet struct {
 }
 
 type signedAction struct {
-	Type string `json:"type"`
-	ID   string `json:"id"`
-	From string `json:"from"`
-	To   string `json:"to,omitempty"`
-	Body string `json:"body,omitempty"`
+	Type    string `json:"type"`
+	ID      string `json:"id"`
+	From    string `json:"from"`
+	To      string `json:"to,omitempty"`
+	Body    string `json:"body,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Channel string `json:"channel,omitempty"`
+	Public  bool   `json:"public,omitempty"`
 }
 
 type keyFile struct {
 	PrivateKey string `json:"private_key"`
+}
+
+type contactsFile struct {
+	Contacts []savedContact `json:"contacts"`
+}
+
+type savedContact struct {
+	Alias   string `json:"alias"`
+	LoginID string `json:"login_id"`
 }
 
 type netMsg struct {
@@ -72,6 +86,9 @@ type model struct {
 	to      string
 	group   string
 	channel string
+
+	contactsPath string
+	contacts     map[string]string
 
 	lines  []string
 	width  int
@@ -123,15 +140,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			if strings.TrimSpace(m.to) == "" {
-				return m, logLine("set recipient with /to <login_id>")
+				return m, logLine("set recipient with /to <login_id|alias>")
 			}
-			id := m.nextMessageID()
-			sig, err := signAction(m.priv, Packet{Type: "send", ID: id, From: m.loginID, To: m.to, Body: line})
-			if err != nil {
-				return m, logLine("sign error: " + err.Error())
-			}
-			pkt := Packet{Type: "send", ID: id, From: m.loginID, To: m.to, Body: line, Group: m.group, Channel: m.channel, PubKey: m.pubB64, Sig: sig}
-			if err := m.enc.Encode(pkt); err != nil {
+			if err := m.sendSigned(Packet{Type: "send", To: m.to, Body: line, Group: m.group, Channel: m.channel}); err != nil {
 				return m, tea.Batch(logLine("send error: "+err.Error()), tea.Quit)
 			}
 			out := fmt.Sprintf("[me -> %s] %s", shortID(m.to), line)
@@ -147,14 +158,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(logLine("network error: "+msg.err.Error()), tea.Quit)
 		}
+		_ = m.ensureContact(msg.pkt.From)
+		_ = m.ensureContact(msg.pkt.To)
 		switch msg.pkt.Type {
-		case "deliver":
+		case "deliver", "channel_deliver":
 			line := fmt.Sprintf("[%s -> %s] %s", shortID(msg.pkt.From), shortID(msg.pkt.To), msg.pkt.Body)
 			if msg.pkt.Group != "" || msg.pkt.Channel != "" {
 				line += fmt.Sprintf(" (%s/%s)", emptyDash(msg.pkt.Group), emptyDash(msg.pkt.Channel))
 			}
 			if msg.pkt.Origin != "" {
 				line += " via " + msg.pkt.Origin
+			}
+			m.lines = append(m.lines, stamp()+" "+line)
+			return m, waitNet(m.events)
+		case "friend_request", "friend_update", "channel_invite", "channel_update", "channel_joined":
+			line := fmt.Sprintf("[%s] from=%s to=%s", msg.pkt.Type, shortID(msg.pkt.From), shortID(msg.pkt.To))
+			if msg.pkt.Group != "" || msg.pkt.Channel != "" {
+				line += fmt.Sprintf(" %s/%s", emptyDash(msg.pkt.Group), emptyDash(msg.pkt.Channel))
+			}
+			if msg.pkt.Body != "" {
+				line += " " + msg.pkt.Body
 			}
 			m.lines = append(m.lines, stamp()+" "+line)
 			return m, waitNet(m.events)
@@ -182,7 +205,7 @@ func (m model) View() string {
 	boxStyle := lipgloss.NewStyle().Border(lipgloss.NormalBorder()).Padding(0, 1)
 
 	header := headerStyle.Render("goAccord TUI") + "  " +
-		statusStyle.Render("login="+shortID(m.loginID)+" to="+emptyDash(shortID(m.to))+" group="+emptyDash(m.group)+" channel="+emptyDash(m.channel))
+		statusStyle.Render("login="+shortID(m.loginID)+" to="+emptyDash(shortID(m.to))+" group="+emptyDash(m.group)+" channel="+emptyDash(m.channel)+fmt.Sprintf(" contacts=%d", len(m.contacts)))
 
 	maxLines := m.height - 6
 	if maxLines < 4 {
@@ -209,13 +232,28 @@ func (m *model) handleCommand(line string) tea.Cmd {
 	}
 	switch parts[0] {
 	case "/help":
-		return logLine("commands: /to <login_id>, /group <name>, /channel <name>, /clearctx, /whoami, /quit")
-	case "/to":
+		return logLine("commands: /to <login_id|alias>, /contacts, /use <login_id|alias>, /remove-contact <alias>, /group <name>, /channel <name>, /clearctx, /whoami, /friend-add <login_id|alias>, /friend-accept <login_id|alias>, /channel-create <group> <channel> <public|private>, /invite <login_id|alias>, /channel-join <group> <channel>, /channel-leave <group> <channel>, /channel-send <text>, /quit")
+	case "/to", "/use":
 		if len(parts) < 2 {
-			return logLine("usage: /to <login_id>")
+			return logLine("usage: " + parts[0] + " <login_id|alias>")
 		}
-		m.to = strings.TrimSpace(parts[1])
+		target, ok := m.resolveRecipient(parts[1])
+		if !ok {
+			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+		}
+		m.to = target
 		return logLine("recipient set: " + shortID(m.to))
+	case "/contacts":
+		return logLine(m.formatContacts())
+	case "/remove-contact":
+		if len(parts) < 2 {
+			return logLine("usage: /remove-contact <alias>")
+		}
+		alias := strings.TrimSpace(parts[1])
+		if err := m.removeContact(alias); err != nil {
+			return logLine("remove contact failed: " + err.Error())
+		}
+		return logLine("removed contact: " + alias)
 	case "/group":
 		if len(parts) < 2 {
 			return logLine("usage: /group <name>")
@@ -234,9 +272,240 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		return logLine("group/channel context cleared")
 	case "/whoami":
 		return logLine("login_id: " + m.loginID)
+	case "/friend-add":
+		if len(parts) < 2 {
+			return logLine("usage: /friend-add <login_id|alias>")
+		}
+		target, ok := m.resolveRecipient(parts[1])
+		if !ok {
+			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+		}
+		if err := m.sendSigned(Packet{Type: "friend_add", To: target}); err != nil {
+			return logLine("friend-add error: " + err.Error())
+		}
+		return logLine("friend request sent to " + shortID(target))
+	case "/friend-accept":
+		if len(parts) < 2 {
+			return logLine("usage: /friend-accept <login_id|alias>")
+		}
+		target, ok := m.resolveRecipient(parts[1])
+		if !ok {
+			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+		}
+		if err := m.sendSigned(Packet{Type: "friend_accept", To: target}); err != nil {
+			return logLine("friend-accept error: " + err.Error())
+		}
+		return logLine("friend accepted: " + shortID(target))
+	case "/channel-create":
+		if len(parts) < 4 {
+			return logLine("usage: /channel-create <group> <channel> <public|private>")
+		}
+		group := strings.TrimSpace(parts[1])
+		channel := strings.TrimSpace(parts[2])
+		mode := strings.ToLower(strings.TrimSpace(parts[3]))
+		isPublic := mode == "public"
+		if mode != "public" && mode != "private" {
+			return logLine("channel mode must be public or private")
+		}
+		if err := m.sendSigned(Packet{Type: "channel_create", Group: group, Channel: channel, Public: isPublic}); err != nil {
+			return logLine("channel-create error: " + err.Error())
+		}
+		m.group = group
+		m.channel = channel
+		return logLine(fmt.Sprintf("channel created: %s/%s (%s)", group, channel, mode))
+	case "/invite":
+		if len(parts) < 2 {
+			return logLine("usage: /invite <login_id|alias> (uses current /group and /channel)")
+		}
+		if strings.TrimSpace(m.group) == "" || strings.TrimSpace(m.channel) == "" {
+			return logLine("set /group and /channel first")
+		}
+		target, ok := m.resolveRecipient(parts[1])
+		if !ok {
+			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+		}
+		if err := m.sendSigned(Packet{Type: "channel_invite", To: target, Group: m.group, Channel: m.channel}); err != nil {
+			return logLine("invite error: " + err.Error())
+		}
+		return logLine(fmt.Sprintf("invited %s to %s/%s", shortID(target), m.group, m.channel))
+	case "/channel-join":
+		if len(parts) < 3 {
+			return logLine("usage: /channel-join <group> <channel>")
+		}
+		group := strings.TrimSpace(parts[1])
+		channel := strings.TrimSpace(parts[2])
+		if err := m.sendSigned(Packet{Type: "channel_join", Group: group, Channel: channel}); err != nil {
+			return logLine("channel-join error: " + err.Error())
+		}
+		m.group = group
+		m.channel = channel
+		return logLine(fmt.Sprintf("join requested: %s/%s", group, channel))
+	case "/channel-leave":
+		if len(parts) < 3 {
+			return logLine("usage: /channel-leave <group> <channel>")
+		}
+		group := strings.TrimSpace(parts[1])
+		channel := strings.TrimSpace(parts[2])
+		if err := m.sendSigned(Packet{Type: "channel_leave", Group: group, Channel: channel}); err != nil {
+			return logLine("channel-leave error: " + err.Error())
+		}
+		if m.group == group && m.channel == channel {
+			m.group = ""
+			m.channel = ""
+		}
+		return logLine(fmt.Sprintf("left: %s/%s", group, channel))
+	case "/channel-send":
+		if len(parts) < 2 {
+			return logLine("usage: /channel-send <text> (uses current /group and /channel)")
+		}
+		if strings.TrimSpace(m.group) == "" || strings.TrimSpace(m.channel) == "" {
+			return logLine("set /group and /channel first")
+		}
+		text := strings.TrimSpace(strings.TrimPrefix(line, parts[0]))
+		if text == "" {
+			return logLine("message text is required")
+		}
+		if err := m.sendSigned(Packet{Type: "channel_send", Group: m.group, Channel: m.channel, Body: text}); err != nil {
+			return logLine("channel-send error: " + err.Error())
+		}
+		return logLine(fmt.Sprintf("[me -> %s/%s] %s", m.group, m.channel, text))
 	default:
 		return logLine("unknown command: " + parts[0])
 	}
+}
+
+func (m *model) resolveRecipient(token string) (string, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return "", false
+	}
+	if id, ok := m.contacts[token]; ok {
+		return id, true
+	}
+	if looksLikeLoginID(token) {
+		_ = m.ensureContact(token)
+		return token, true
+	}
+	return "", false
+}
+
+func (m *model) formatContacts() string {
+	if len(m.contacts) == 0 {
+		return "no saved contacts"
+	}
+	aliases := make([]string, 0, len(m.contacts))
+	for a := range m.contacts {
+		aliases = append(aliases, a)
+	}
+	sort.Strings(aliases)
+	lines := make([]string, 0, len(aliases)+1)
+	lines = append(lines, "saved contacts:")
+	for _, a := range aliases {
+		lines = append(lines, fmt.Sprintf("  %s -> %s", a, m.contacts[a]))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) ensureContact(loginID string) error {
+	loginID = strings.TrimSpace(loginID)
+	if !looksLikeLoginID(loginID) || loginID == m.loginID {
+		return nil
+	}
+	for _, id := range m.contacts {
+		if id == loginID {
+			return nil
+		}
+	}
+	base := shortID(loginID)
+	alias := base
+	for i := 2; ; i++ {
+		if _, exists := m.contacts[alias]; !exists {
+			break
+		}
+		alias = fmt.Sprintf("%s-%d", base, i)
+	}
+	m.contacts[alias] = loginID
+	return saveContacts(m.contactsPath, m.contacts)
+}
+
+func (m *model) removeContact(alias string) error {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return fmt.Errorf("alias required")
+	}
+	if _, ok := m.contacts[alias]; !ok {
+		return fmt.Errorf("alias not found")
+	}
+	delete(m.contacts, alias)
+	return saveContacts(m.contactsPath, m.contacts)
+}
+
+func (m *model) sendSigned(p Packet) error {
+	p.ID = m.nextMessageID()
+	p.From = m.loginID
+	p.PubKey = m.pubB64
+	sig, err := signAction(m.priv, p)
+	if err != nil {
+		return err
+	}
+	p.Sig = sig
+	return m.enc.Encode(p)
+}
+
+func looksLikeLoginID(v string) bool {
+	if len(v) != 64 {
+		return false
+	}
+	for _, ch := range v {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func loadContacts(path string) (map[string]string, error) {
+	out := make(map[string]string)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return nil, err
+	}
+	var f contactsFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, err
+	}
+	for _, c := range f.Contacts {
+		alias := strings.TrimSpace(c.Alias)
+		id := strings.TrimSpace(c.LoginID)
+		if alias == "" || !looksLikeLoginID(id) {
+			continue
+		}
+		out[alias] = id
+	}
+	return out, nil
+}
+
+func saveContacts(path string, contacts map[string]string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	aliases := make([]string, 0, len(contacts))
+	for a := range contacts {
+		aliases = append(aliases, a)
+	}
+	sort.Strings(aliases)
+	f := contactsFile{Contacts: make([]savedContact, 0, len(aliases))}
+	for _, a := range aliases {
+		f.Contacts = append(f.Contacts, savedContact{Alias: a, LoginID: contacts[a]})
+	}
+	payload, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, payload, 0o600)
 }
 
 func maxInt(a, b int) int {
@@ -304,7 +573,7 @@ func loadOrCreateKey(path string) (ed25519.PrivateKey, error) {
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Public: p.Public})
 	if err != nil {
 		return "", err
 	}
@@ -388,25 +657,35 @@ func (m *model) nextMessageID() string {
 }
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:9000", "server address")
+	addr := flag.String("addr", "127.0.0.1:9101", "server address")
 	keyPath := flag.String("key", "", "private key file path")
-	to := flag.String("to", "", "initial recipient login_id")
+	contactsPath := flag.String("contacts", "", "contacts file path")
+	to := flag.String("to", "", "initial recipient login_id or alias")
 	group := flag.String("group", "", "initial group label")
 	channel := flag.String("channel", "", "initial channel label")
 	flag.Parse()
 
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("unable to resolve home directory: %v\n", err)
+		os.Exit(1)
+	}
+
 	if strings.TrimSpace(*keyPath) == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			fmt.Printf("unable to resolve home directory: %v\n", err)
-			os.Exit(1)
-		}
 		*keyPath = filepath.Join(home, ".goaccord", "ed25519_key.json")
+	}
+	if strings.TrimSpace(*contactsPath) == "" {
+		*contactsPath = filepath.Join(home, ".goaccord", "contacts.json")
 	}
 
 	priv, err := loadOrCreateKey(*keyPath)
 	if err != nil {
 		fmt.Printf("key load/create failed: %v\n", err)
+		os.Exit(1)
+	}
+	contacts, err := loadContacts(*contactsPath)
+	if err != nil {
+		fmt.Printf("contacts load failed: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -423,21 +702,32 @@ func main() {
 	in.Width = 80
 
 	m := model{
-		input:   in,
-		enc:     enc,
-		events:  events,
-		conn:    conn,
-		priv:    priv,
-		pubB64:  pubB64,
-		loginID: loginID,
-		to:      strings.TrimSpace(*to),
-		group:   strings.TrimSpace(*group),
-		channel: strings.TrimSpace(*channel),
+		input:        in,
+		enc:          enc,
+		events:       events,
+		conn:         conn,
+		priv:         priv,
+		pubB64:       pubB64,
+		loginID:      loginID,
+		contactsPath: *contactsPath,
+		contacts:     contacts,
+		group:        strings.TrimSpace(*group),
+		channel:      strings.TrimSpace(*channel),
 		lines: []string{
 			stamp() + " connected to " + *addr,
 			stamp() + " login_id: " + loginID,
+			stamp() + " contacts file: " + *contactsPath,
 			stamp() + " /help for commands",
 		},
+	}
+
+	if initialTo := strings.TrimSpace(*to); initialTo != "" {
+		if resolved, ok := m.resolveRecipient(initialTo); ok {
+			m.to = resolved
+			m.lines = append(m.lines, stamp()+" initial recipient: "+shortID(resolved))
+		} else {
+			m.lines = append(m.lines, stamp()+" unknown initial recipient: "+initialTo)
+		}
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())

@@ -14,10 +14,7 @@ Transport:
 - Backward-compatible changes:
   - adding optional fields
   - adding new packet types that old nodes can ignore
-- Breaking changes require:
-  - update this document
-  - coordinated implementation update
-  - migration note in release/commit message
+- Breaking changes require coordinated updates to this document and code.
 
 ## Identity Primitives
 - User identity:
@@ -25,244 +22,149 @@ Transport:
 - Server identity:
   - `server_id = owner_login_id:sid`
 
-Signatures:
-- User auth challenge signature payload: `"login:" + nonce`
-- Server identity signature payload: `"server:" + server_id`
-- User message signature payload is JSON of:
-  - `{"type":"send","id":"...","from":"...","to":"...","body":"..."}`
+## Signature Payloads
+User auth challenge signature payload:
+- `"login:" + nonce`
 
-Important:
-- `group` and `channel` are currently NOT part of message signature payload.
+Server identity signature payload:
+- `"server:" + server_id`
+
+Signed action payload (JSON object):
+```json
+{
+  "type": "...",
+  "id": "...",
+  "from": "...",
+  "to": "...",
+  "body": "...",
+  "group": "...",
+  "channel": "...",
+  "public": false
+}
+```
+Notes:
+- `to/body/group/channel/public` are omitted when empty/false.
+- Signature verification requires `from == sha256(pub_key)`.
 
 ## Packet Envelope
-All packets are JSON objects. Common fields:
-
-- `type` string: packet type (required)
-- `id` string: message or identity id (type-dependent)
-- `from` string: sender `login_id` (type-dependent)
-- `to` string: recipient `login_id` (type-dependent)
-- `body` string: message body or error text
-- `group` string: optional group label
-- `channel` string: optional channel label
-- `origin` string: server id that performed local delivery/persistence operation
-- `pub_key` string: base64-encoded Ed25519 public key
-- `sig` string: base64-encoded Ed25519 signature
-
-Peer/session fields:
-- `role` string: `user` or `server`
-- `nonce` string: login challenge nonce
-- `listen` string: advertised peer `host:port`
-- `addrs` array: peer address list
+Common fields:
+- `type` string (required)
+- `role` string (`user|server` for hello)
+- `id` string
+- `from` string
+- `to` string
+- `body` string
+- `group` string
+- `channel` string
+- `public` bool
+- `origin` string
+- `nonce` string
+- `pub_key` string (base64 Ed25519 public key)
+- `sig` string (base64 Ed25519 signature)
+- `listen` string (`host:port`)
+- `addrs` array of addresses
 - `max_msg_bytes` number
 - `max_msgs_per_sec` number
 - `burst` number
 - `caps` array of strings
 
-## Packet Types
+## Connection Handshake
+### User
+1. Client -> server: `hello(role=user,pub_key)`
+2. Server -> client: `challenge(nonce)`
+3. Client -> server: `auth(pub_key,sig(login:nonce))`
+4. Server -> client: `ok(id=login_id)` or `error`
 
-### `hello`
-First packet on a connection.
-
-User hello:
-```json
-{"type":"hello","role":"user","pub_key":"<base64>"}
-```
-
-Server hello:
-```json
-{
-  "type":"hello",
-  "role":"server",
-  "id":"<server_id>",
-  "pub_key":"<base64 owner pubkey>",
-  "sig":"<base64 sig over server:server_id>",
-  "listen":"<host:port>",
-  "max_msg_bytes":16384,
-  "max_msgs_per_sec":50,
-  "burst":100,
-  "caps":["transport","relay","client_public"]
-}
-```
-
-### `challenge`
-Server -> user login challenge:
-```json
-{"type":"challenge","nonce":"<opaque>"}
-```
-
-### `auth`
-User -> server auth response:
-```json
-{"type":"auth","pub_key":"<base64>","sig":"<base64 sig over login:nonce>"}
-```
-
-### `ok`
-Generic success response.
-
-User auth success:
-```json
-{"type":"ok","id":"<login_id>","body":"authenticated"}
-```
-
-Server peer-accept success:
-```json
-{
-  "type":"ok",
-  "id":"<server_id>",
-  "body":"peer accepted",
-  "pub_key":"<base64 owner pubkey>",
-  "sig":"<base64 sig over server:server_id>",
-  "listen":"<host:port>",
-  "max_msg_bytes":16384,
-  "max_msgs_per_sec":50,
-  "burst":100,
-  "caps":["transport","relay","client_public"]
-}
-```
-
-### `error`
-Generic failure response:
-```json
-{"type":"error","body":"<reason>"}
-```
-
-### `send`
-Signed user message (user->server and server->server relay):
-```json
-{
-  "type":"send",
-  "id":"<message_id>",
-  "from":"<sender_login_id>",
-  "to":"<recipient_login_id>",
-  "body":"<text>",
-  "group":"<optional>",
-  "channel":"<optional>",
-  "pub_key":"<base64 sender pubkey>",
-  "sig":"<base64 signature>"
-}
-```
-
-### `deliver`
-Delivered message (server -> user):
-```json
-{
-  "type":"deliver",
-  "id":"<message_id>",
-  "from":"<sender_login_id>",
-  "to":"<recipient_login_id>",
-  "body":"<text>",
-  "group":"<optional>",
-  "channel":"<optional>",
-  "origin":"<server_id>",
-  "pub_key":"<base64 sender pubkey>",
-  "sig":"<base64 signature>"
-}
-```
-
-### `getaddr`
-Peer address request:
-```json
-{"type":"getaddr"}
-```
-
-### `addr`
-Peer address advertisement:
-```json
-{"type":"addr","addrs":["host1:port","host2:port"]}
-```
-
-## State Machines
-
-### User Session Flow
-1. Client sends `hello(role=user, pub_key)`.
-2. Server replies `challenge(nonce)`.
-3. Client sends `auth(pub_key, sig(login:nonce))`.
-4. Server verifies signature and policy, then sends `ok(id=login_id)`.
-5. Client may send `send` packets.
-6. Server may send `deliver` packets asynchronously.
-
-### Peer Session Flow
-1. Initiator sends `hello(role=server, id, pub_key, sig, listen, limits, caps)`.
+### Peer
+1. Initiator -> peer: `hello(role=server,id,pub_key,sig,listen,limits,caps)`
 2. Receiver verifies server identity proof.
-3. Receiver replies `ok(...)` with its own identity proof and policy.
-4. Both sides exchange `getaddr` / `addr` and relay `send` packets.
+3. Receiver -> initiator: `ok(id,pub_key,sig,listen,limits,caps)` or `error`
+4. Peers exchange `getaddr`/`addr` and relay signed actions.
 
-## Validation and Enforcement Rules
+## Packet Types
+### Core
+- `hello`
+- `challenge`
+- `auth`
+- `ok`
+- `error`
+- `getaddr`
+- `addr`
 
-Connection-level:
-- First packet MUST be `hello`; otherwise server returns `error` and closes.
-- Packet size above local `max_msg_bytes` is ignored/dropped.
-- Packet rate above local limiter is ignored/dropped.
+### Signed action packets (must include `id,from,pub_key,sig`)
+- `send`
+- `friend_add`
+- `friend_accept`
+- `channel_create`
+- `channel_invite`
+- `channel_join`
+- `channel_leave`
+- `channel_send`
 
-User auth:
-- `auth.pub_key` must be valid Ed25519 public key.
-- `login_id` must match `sha256(pub_key)`.
-- Signature must verify over `login:nonce`.
+### Server-generated notifications
+- `deliver`
+- `channel_deliver`
+- `friend_request`
+- `friend_update`
+- `channel_update`
+- `channel_joined`
+- `channel_invite` (also used as server notification)
 
-Message acceptance (`send`):
-- Required non-empty fields: `id`, `from`, `to`, `body`.
-- `from` must match authenticated user for user sessions.
-- Signature must verify and pubkey-derived login must equal `from`.
-- Duplicate `id` values are dropped by dedupe cache.
+## Action Semantics
+### `send`
+- Required: `to`, `body`
+- Behavior: direct user-to-user delivery (`deliver`).
 
-Relay behavior:
-- Nodes relay only when local `relay` is enabled.
-- Forwarding to peers is limited to peers advertising `relay` capability.
-- Forwarding skips peers where serialized packet exceeds peer-advertised `max_msg_bytes`.
+### Friend model
+- `friend_add`:
+  - requester indicates intent to friend `to`.
+  - if reciprocal request already exists, friendship is established.
+  - target receives `friend_request` (or both receive `friend_update` if mutual).
+- `friend_accept`:
+  - accept pending request from `to` -> `from` direction.
+  - on success both users receive `friend_update`.
 
-Peer misbehavior handling:
-- Unknown/malformed/invalid peer packets increase local peer score.
-- Score threshold triggers temporary local ban.
+### Channel model
+Channel key is `(group, channel)`.
 
-## Capabilities and Policy Fields
+- `channel_create`:
+  - required: `group`, `channel`
+  - creator becomes member
+  - `public=true` creates/marks channel as public
+- `channel_invite`:
+  - required: `to`, `group`, `channel`
+  - invite rules:
+    - public channel: any authenticated user may invite anyone
+    - private channel: inviter must be member
+    - private channel and inviter is non-owner member: inviter must be friends with invitee
+- `channel_join`:
+  - required: `group`, `channel`
+  - allowed if:
+    - already member, or
+    - channel is public, or
+    - user has invite
+- `channel_leave`:
+  - required: `group`, `channel`
+  - removes membership if present
+- `channel_send`:
+  - required: `group`, `channel`, `body`
+  - sender must be member
+  - server fans out `channel_deliver` to members
 
-Current capability flags:
-- `transport`
-- `relay`
-- `client_public`
-- `client_private`
-- `client_disabled`
+## Relay Rules
+- Nodes relay signed action packets when local relay is enabled.
+- Nodes relay only to peers advertising `relay` capability.
+- Dedupe cache (`id`) prevents loops.
 
-Policy fields exchanged in peer hello/ok:
-- `max_msg_bytes`
-- `max_msgs_per_sec`
-- `burst`
+## Validation Rules
+Signed action packets are dropped if:
+- type is not one of signed action types
+- missing required fields for packet type
+- signature invalid
+- duplicate `id` seen
 
-Interpretation:
-- Policies are advisory for remote senders and enforced locally per node.
-
-## Client Access Modes
-
-Server setting `client-mode`:
-- `public`: allow any authenticated user.
-- `private`: allow only users in server allowlist.
-- `disabled`: reject all user logins.
-
-## Persistence Mode Semantics
-
-Server setting `persistence-mode`:
-- `live` (default): no durable user message state.
-- `persist`: SQLite-backed durable state enabled.
-
-Persist mode behavior:
-- Authenticated users can be hosted identities:
-  - auto-host if `persist-auto-host=true`
-  - otherwise must already exist in hosted set
-- Messages to hosted offline recipients are queued.
-- Queued messages are replayed on next login (`deliver` packets).
-- Group/channel labels and seen peer server identities may be stored.
-
-## Error Behaviors
-Common `error.body` values include:
-- `first packet must be hello`
-- `auth failed: ...`
-- `client access not allowed by this server`
-- `unknown role`
-- `invalid server identity proof`
-- `peer temporarily banned`
-- `duplicate peer id`
-
-## Resource Limits (Current Defaults)
+## Policy and Limits
+Defaults:
 - `max_msg_bytes`: 16384
 - `max_msgs_per_sec`: 50
 - `burst`: 100
@@ -272,7 +174,19 @@ Common `error.body` values include:
 - peer ban score threshold: 20
 - peer ban duration: 10m
 
+## Persistence Mode
+`persistence-mode=persist` enables local SQLite-backed state.
+Current persisted scope includes:
+- hosted users
+- queued direct deliveries for hosted offline users
+- observed group/channel metadata
+- observed server metadata
+
+Note:
+- offline queue/replay currently targets direct-style delivery payloads.
+
 ## Planned Extensions
-- Explicit group/channel operations (`group_create`, `group_join`, `channel_create`, `channel_send`).
-- Capability-negotiated binary transport (for example `proto_bin_v1`) after protocol stabilizes.
-- Explicit packet-level protocol version negotiation.
+- explicit protocol version negotiation
+- richer channel roles/ACLs
+- ack/replay cursor protocol (`since_seq` / `since_time`)
+- capability-negotiated binary transport

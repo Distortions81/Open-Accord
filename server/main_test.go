@@ -267,17 +267,29 @@ func (c *testClient) close() {
 	_ = c.conn.Close()
 }
 
-func (c *testClient) send(t *testing.T, to, body string) {
+func (c *testClient) sendAction(t *testing.T, p Packet) {
 	t.Helper()
 	c.counter++
-	id := fmt.Sprintf("test-%d", c.counter)
-	sig, err := signTestMessage(c.priv, id, c.loginID, to, body)
+	prefix := c.loginID
+	if len(prefix) > 8 {
+		prefix = prefix[:8]
+	}
+	id := fmt.Sprintf("%s-test-%d", prefix, c.counter)
+	p.ID = id
+	p.From = c.loginID
+	p.PubKey = c.pubB64
+	sig, err := signAction(c.priv, p)
 	if err != nil {
 		t.Fatalf("sign failed: %v", err)
 	}
-	if err := c.enc.Encode(Packet{Type: "send", ID: id, From: c.loginID, To: to, Body: body, PubKey: c.pubB64, Sig: sig}); err != nil {
+	p.Sig = sig
+	if err := c.enc.Encode(p); err != nil {
 		t.Fatalf("send failed: %v", err)
 	}
+}
+
+func (c *testClient) send(t *testing.T, to, body string) {
+	c.sendAction(t, Packet{Type: "send", To: to, Body: body})
 }
 
 func (c *testClient) recv(t *testing.T, timeout time.Duration) Packet {
@@ -562,4 +574,70 @@ func TestPersistModeCanRequirePreHostedUsers(t *testing.T) {
 	if !strings.Contains(blockedResp.Body, "client access not allowed") {
 		t.Fatalf("unexpected blocked response: %+v", blockedResp)
 	}
+}
+
+func TestFriendAddAndAcceptCreatesMutualFriendship(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, s, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+	bob := newTestClient(t, addr)
+	defer bob.close()
+
+	alice.sendAction(t, Packet{Type: "friend_add", To: bob.loginID})
+	time.Sleep(120 * time.Millisecond)
+	bob.sendAction(t, Packet{Type: "friend_accept", To: alice.loginID})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.isFriend(alice.loginID, bob.loginID) && s.isFriend(bob.loginID, alice.loginID) {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("friendship was not established")
+}
+
+func TestPublicChannelAllowsAnyUserToInviteAndJoin(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, s, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+	bob := newTestClient(t, addr)
+	defer bob.close()
+	charlie := newTestClient(t, addr)
+	defer charlie.close()
+
+	alice.sendAction(t, Packet{Type: "channel_create", Group: "dev", Channel: "general", Public: true})
+	deadlineCreate := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadlineCreate) {
+		s.mu.RLock()
+		_, ok := s.channels[channelKey("dev", "general")]
+		s.mu.RUnlock()
+		if ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	bob.sendAction(t, Packet{Type: "channel_invite", To: charlie.loginID, Group: "dev", Channel: "general"})
+	time.Sleep(120 * time.Millisecond)
+	charlie.sendAction(t, Packet{Type: "channel_join", Group: "dev", Channel: "general"})
+	time.Sleep(120 * time.Millisecond)
+	alice.sendAction(t, Packet{Type: "channel_send", Group: "dev", Channel: "general", Body: "hi channel"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msg, err := charlie.recvMaybe(150 * time.Millisecond)
+		if err != nil {
+			continue
+		}
+		if msg.Type == "channel_deliver" && msg.Body == "hi channel" {
+			return
+		}
+	}
+	t.Fatalf("channel message not delivered to joined member")
 }
