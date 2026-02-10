@@ -248,6 +248,21 @@ func waitForPeerCount(t *testing.T, s *Server, want int, timeout time.Duration) 
 	t.Fatalf("peer count did not reach %d", want)
 }
 
+func waitForUserDisconnected(t *testing.T, s *Server, loginID string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		s.mu.RLock()
+		_, ok := s.users[loginID]
+		s.mu.RUnlock()
+		if !ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("user %s did not disconnect in time", loginID)
+}
+
 func (c *testClient) close() {
 	_ = c.conn.Close()
 }
@@ -480,7 +495,7 @@ func TestPersistModeQueuesAndReplaysOfflineMessages(t *testing.T) {
 	tempDir := t.TempDir()
 	cfg.persistenceDB = tempDir + "/state.sqlite"
 
-	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	addr, s, stop := startTestServer(t, "s1", "", nil, cfg)
 	defer stop()
 
 	alice := newTestClient(t, addr)
@@ -493,9 +508,9 @@ func TestPersistModeQueuesAndReplaysOfflineMessages(t *testing.T) {
 	bob1 := newTestClientWithKey(t, addr, bobPriv)
 	bobID := bob1.loginID
 	bob1.close()
+	waitForUserDisconnected(t, s, bobID, 2*time.Second)
 
 	alice.send(t, bobID, "queued-1")
-	time.Sleep(150 * time.Millisecond)
 
 	bob2 := newTestClientWithKey(t, addr, bobPriv)
 	defer bob2.close()

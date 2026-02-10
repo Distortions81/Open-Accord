@@ -34,10 +34,11 @@ type Packet struct {
 }
 
 type signedMessage struct {
+	Type string `json:"type"`
 	ID   string `json:"id"`
 	From string `json:"from"`
-	To   string `json:"to"`
-	Body string `json:"body"`
+	To   string `json:"to,omitempty"`
+	Body string `json:"body,omitempty"`
 }
 
 type keyFile struct {
@@ -85,7 +86,7 @@ func loadOrCreateKey(path string) (ed25519.PrivateKey, error) {
 }
 
 func signMessage(priv ed25519.PrivateKey, id, from, to, body string) (string, error) {
-	msg, err := json.Marshal(signedMessage{ID: id, From: from, To: to, Body: body})
+	msg, err := json.Marshal(signedMessage{Type: "send", ID: id, From: from, To: to, Body: body})
 	if err != nil {
 		return "", err
 	}
