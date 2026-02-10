@@ -31,6 +31,7 @@ On startup it:
 - Profile fetch for target
 - Live chat/info event polling
 - DM target list from contacts/friends
+- Presence mode (`visible`/`invisible`) with periodic keepalive and TTL-based friend status checks
 
 ## Notes
 

@@ -89,6 +89,18 @@ type profilePayload struct {
 	ProfileText string `json:"profile_text,omitempty"`
 }
 
+type presenceKeepalivePayload struct {
+	Visible bool `json:"visible"`
+	TTLSec  int  `json:"ttl_sec"`
+}
+
+type presenceDataPayload struct {
+	State     string `json:"state"`
+	TTLSec    int    `json:"ttl_sec"`
+	UpdatedAt int64  `json:"updated_at,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+}
+
 type contactsFile struct {
 	Contacts []savedContact `json:"contacts"`
 }
@@ -129,6 +141,12 @@ type dmTarget struct {
 	ProfileText   string `json:"profile_text,omitempty"`
 	LastRefreshed int64  `json:"last_refreshed,omitempty"`
 	Online        string `json:"online,omitempty"`
+	OnlineTTLSec  int    `json:"online_ttl_sec,omitempty"`
+}
+
+type groupEntry struct {
+	Name     string   `json:"name"`
+	Channels []string `json:"channels,omitempty"`
 }
 
 type webClient struct {
@@ -145,13 +163,17 @@ type webClient struct {
 	contactsPath string
 	profilePath  string
 
-	contacts          map[string]string
-	nicknames         map[string]string
-	peerProfiles      map[string]string
-	profileRefreshed  map[string]int64
-	presence          map[string]string
-	friends           map[string]struct{}
-	lastFriendRequest string
+	contacts         map[string]string
+	nicknames        map[string]string
+	peerProfiles     map[string]string
+	profileRefreshed map[string]int64
+	presence         map[string]string
+	presenceTTL      map[string]int
+	presenceVisible  bool
+	presenceTTLSec   int
+	friends          map[string]struct{}
+	pendingFriends   map[string]int64
+	groups           map[string]map[string]struct{}
 
 	events  []webEvent
 	nextSeq int64
@@ -163,6 +185,11 @@ const (
 	compressionNone  = "none"
 	compressionZlib  = "zlib"
 	compressMinBytes = 64
+
+	presenceKeepaliveInterval = 5 * time.Minute
+	minPresenceTTLSec         = 180
+	maxPresenceTTLSec         = 900
+	defaultPresenceTTLSec     = 390
 )
 
 func stamp() string { return time.Now().Format("15:04:05") }
@@ -281,19 +308,54 @@ func (c *webClient) requestPresence(target string) {
 	_ = c.enc.Encode(Packet{Type: "presence_get", To: target})
 }
 
-func (c *webClient) setPresence(loginID string, state string) {
+func normalizePresenceTTLSec(ttl int) int {
+	if ttl < minPresenceTTLSec {
+		return minPresenceTTLSec
+	}
+	if ttl > maxPresenceTTLSec {
+		return maxPresenceTTLSec
+	}
+	return ttl
+}
+
+func (c *webClient) sendPresenceKeepalive() error {
+	c.mu.Lock()
+	visible := c.presenceVisible
+	ttl := normalizePresenceTTLSec(c.presenceTTLSec)
+	c.presenceTTLSec = ttl
+	c.mu.Unlock()
+	b, err := json.Marshal(presenceKeepalivePayload{Visible: visible, TTLSec: ttl})
+	if err != nil {
+		return err
+	}
+	return c.sendSigned(Packet{Type: "presence_keepalive", Body: string(b)})
+}
+
+func (c *webClient) setOwnPresenceConfig(visible bool, ttlSec int) error {
+	ttlSec = normalizePresenceTTLSec(ttlSec)
+	c.mu.Lock()
+	c.presenceVisible = visible
+	c.presenceTTLSec = ttlSec
+	c.mu.Unlock()
+	return c.sendPresenceKeepalive()
+}
+
+func (c *webClient) setPresence(loginID string, state string, ttl int) {
 	loginID = strings.TrimSpace(loginID)
 	state = strings.ToLower(strings.TrimSpace(state))
 	if !looksLikeLoginID(loginID) {
 		return
 	}
 	switch state {
-	case "online", "offline":
+	case "online", "offline", "invisible":
 	default:
 		state = "unknown"
 	}
 	c.mu.Lock()
 	c.presence[loginID] = state
+	if ttl > 0 {
+		c.presenceTTL[loginID] = normalizePresenceTTLSec(ttl)
+	}
 	c.mu.Unlock()
 }
 
@@ -343,6 +405,22 @@ func (c *webClient) upsertPeerProfile(loginID, text string) {
 	_ = saveProfile(c.profilePath, displayName, profileText, nickCopy, peerCopy, refCopy)
 }
 
+func (c *webClient) rememberGroup(group string, channel string) {
+	group = strings.TrimSpace(group)
+	channel = strings.TrimSpace(channel)
+	if group == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.groups[group] == nil {
+		c.groups[group] = make(map[string]struct{})
+	}
+	if channel != "" {
+		c.groups[group][channel] = struct{}{}
+	}
+	c.mu.Unlock()
+}
+
 func (c *webClient) networkLoop(ch <-chan netMsg) {
 	for ev := range ch {
 		if ev.err != nil {
@@ -358,6 +436,7 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 		case "deliver", "channel_deliver":
 			line := p.Body
 			if strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" {
+				c.rememberGroup(p.Group, p.Channel)
 				line = fmt.Sprintf("[%s/%s] %s", p.Group, p.Channel, line)
 			}
 			c.addEventWithActor("chat", line, p.From)
@@ -367,12 +446,15 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 		case "friend_request":
 			if p.To == c.loginID && looksLikeLoginID(p.From) {
 				c.mu.Lock()
-				c.lastFriendRequest = p.From
+				c.pendingFriends[p.From] = time.Now().Unix()
 				c.mu.Unlock()
 				c.requestProfile(p.From)
 			}
 			c.addEvent("info", fmt.Sprintf("friend request from %s", c.displayPeer(p.From)))
 		case "friend_update", "channel_invite", "channel_update", "channel_joined":
+			if strings.TrimSpace(p.Group) != "" {
+				c.rememberGroup(p.Group, p.Channel)
+			}
 			if p.Type == "friend_update" {
 				other := p.From
 				if other == c.loginID {
@@ -381,6 +463,7 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				if looksLikeLoginID(other) && other != c.loginID {
 					c.mu.Lock()
 					c.friends[other] = struct{}{}
+					delete(c.pendingFriends, other)
 					c.mu.Unlock()
 				}
 			}
@@ -413,7 +496,12 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			}
 			c.addEvent("info", line)
 		case "presence_data":
-			c.setPresence(p.From, p.Body)
+			var pd presenceDataPayload
+			if err := json.Unmarshal([]byte(strings.TrimSpace(p.Body)), &pd); err == nil {
+				c.setPresence(p.From, pd.State, pd.TTLSec)
+			} else {
+				c.setPresence(p.From, p.Body, 0)
+			}
 		case "error":
 			c.addEvent("info", "server error: "+p.Body)
 		default:
@@ -477,7 +565,58 @@ func (c *webClient) dmTargets() []dmTarget {
 			ProfileText:   strings.TrimSpace(c.peerProfiles[id]),
 			LastRefreshed: c.profileRefreshed[id],
 			Online:        strings.TrimSpace(c.presence[id]),
+			OnlineTTLSec:  c.presenceTTL[id],
 		})
+	}
+	return out
+}
+
+func (c *webClient) pendingFriendRequests() []dmTarget {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ids := make([]string, 0, len(c.pendingFriends))
+	for id := range c.pendingFriends {
+		if !looksLikeLoginID(id) || id == c.loginID {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		return strings.ToLower(c.displayPeerLocked(ids[i])) < strings.ToLower(c.displayPeerLocked(ids[j]))
+	})
+	out := make([]dmTarget, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, dmTarget{
+			ID:            id,
+			Label:         c.displayPeerLocked(id),
+			Nickname:      strings.TrimSpace(c.nicknames[id]),
+			ProfileText:   strings.TrimSpace(c.peerProfiles[id]),
+			LastRefreshed: c.pendingFriends[id],
+			Online:        strings.TrimSpace(c.presence[id]),
+			OnlineTTLSec:  c.presenceTTL[id],
+		})
+	}
+	return out
+}
+
+func (c *webClient) groupsList() []groupEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	names := make([]string, 0, len(c.groups))
+	for g := range c.groups {
+		names = append(names, g)
+	}
+	sort.Strings(names)
+	out := make([]groupEntry, 0, len(names))
+	for _, g := range names {
+		channels := make([]string, 0, len(c.groups[g]))
+		for ch := range c.groups[g] {
+			if strings.TrimSpace(ch) != "" {
+				channels = append(channels, ch)
+			}
+		}
+		sort.Strings(channels)
+		out = append(out, groupEntry{Name: g, Channels: channels})
 	}
 	return out
 }
@@ -493,6 +632,7 @@ func (c *webClient) profileCard(loginID string) dmTarget {
 		ProfileText:   strings.TrimSpace(c.peerProfiles[loginID]),
 		LastRefreshed: c.profileRefreshed[loginID],
 		Online:        strings.TrimSpace(c.presence[loginID]),
+		OnlineTTLSec:  c.presenceTTL[loginID],
 	}
 }
 
@@ -509,10 +649,17 @@ func decodeJSON(r *http.Request, dst any) error {
 
 func (c *webClient) handleBootstrap(w http.ResponseWriter, _ *http.Request) {
 	resp := map[string]any{
-		"login_id":     c.loginID,
-		"display_name": c.displayName,
-		"profile_text": c.profileText,
-		"targets":      c.dmTargets(),
+		"login_id":          c.loginID,
+		"display_name":      c.displayName,
+		"profile_text":      c.profileText,
+		"targets":           c.dmTargets(),
+		"pending_friends":   c.pendingFriendRequests(),
+		"groups":            c.groupsList(),
+		"presence_visible":  c.presenceVisible,
+		"presence_ttl_sec":  c.presenceTTLSec,
+		"presence_ttl_min":  minPresenceTTLSec,
+		"presence_ttl_max":  maxPresenceTTLSec,
+		"presence_interval": int(presenceKeepaliveInterval / time.Second),
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -534,7 +681,9 @@ func (c *webClient) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Unlock()
 	targets := c.dmTargets()
-	writeJSON(w, http.StatusOK, map[string]any{"events": items, "targets": targets})
+	pending := c.pendingFriendRequests()
+	groups := c.groupsList()
+	writeJSON(w, http.StatusOK, map[string]any{"events": items, "targets": targets, "pending_friends": pending, "groups": groups})
 }
 
 func (c *webClient) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -599,22 +748,10 @@ func (c *webClient) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	target := ""
-	if strings.TrimSpace(req.To) != "" {
-		var ok bool
-		target, ok = c.resolveRecipient(req.To)
-		if !ok {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown recipient"})
-			return
-		}
-	} else {
-		c.mu.Lock()
-		target = c.lastFriendRequest
-		c.mu.Unlock()
-		if strings.TrimSpace(target) == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no recent friend request"})
-			return
-		}
+	target, ok := c.resolveRecipient(req.To)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown recipient"})
+		return
 	}
 	if err := c.sendSigned(Packet{Type: "friend_accept", To: target}); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -624,11 +761,29 @@ func (c *webClient) handleFriendAccept(w http.ResponseWriter, r *http.Request) {
 		c.requestProfile(target)
 	}
 	c.mu.Lock()
-	if c.lastFriendRequest == target {
-		c.lastFriendRequest = ""
-	}
+	delete(c.pendingFriends, target)
 	c.mu.Unlock()
 	c.addEvent("info", "friend accepted: "+c.displayPeer(target))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (c *webClient) handleFriendIgnore(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		To string `json:"to"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	target, ok := c.resolveRecipient(req.To)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown recipient"})
+		return
+	}
+	c.mu.Lock()
+	delete(c.pendingFriends, target)
+	c.mu.Unlock()
+	c.addEvent("info", "friend request ignored: "+c.displayPeer(target))
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -710,8 +865,48 @@ func (c *webClient) handlePresenceCheck(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (c *webClient) handlePresenceSet(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Visible *bool `json:"visible"`
+		TTLSec  *int  `json:"ttl_sec"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	c.mu.Lock()
+	visible := c.presenceVisible
+	ttl := c.presenceTTLSec
+	c.mu.Unlock()
+	if req.Visible != nil {
+		visible = *req.Visible
+	}
+	if req.TTLSec != nil {
+		ttl = *req.TTLSec
+	}
+	if err := c.setOwnPresenceConfig(visible, ttl); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	mode := "invisible"
+	if visible {
+		mode = "visible"
+	}
+	ttl = normalizePresenceTTLSec(ttl)
+	c.addEvent("info", fmt.Sprintf("presence updated: %s ttl=%ds", mode, ttl))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"visible": visible,
+		"ttl_sec": ttl,
+	})
+}
+
 func (c *webClient) handleTargets(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"targets": c.dmTargets()})
+	writeJSON(w, http.StatusOK, map[string]any{"targets": c.dmTargets(), "pending_friends": c.pendingFriendRequests()})
+}
+
+func (c *webClient) handleGroups(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"groups": c.groupsList()})
 }
 
 func (c *webClient) handleProfileCard(w http.ResponseWriter, r *http.Request) {
@@ -1372,7 +1567,12 @@ func main() {
 		peerProfiles:     peerProfiles,
 		profileRefreshed: profileRefreshed,
 		presence:         make(map[string]string),
+		presenceTTL:      make(map[string]int),
+		presenceVisible:  true,
+		presenceTTLSec:   defaultPresenceTTLSec,
 		friends:          make(map[string]struct{}),
+		pendingFriends:   make(map[string]int64),
+		groups:           make(map[string]map[string]struct{}),
 	}
 	client.addEvent("info", "connected to "+*serverAddr)
 	client.addEvent("info", "login_id: "+loginID)
@@ -1380,11 +1580,23 @@ func main() {
 	if err := client.publishOwnProfile(); err != nil {
 		client.addEvent("info", "profile publish failed: "+err.Error())
 	}
+	if err := client.sendPresenceKeepalive(); err != nil {
+		client.addEvent("info", "presence keepalive failed: "+err.Error())
+	}
 	for _, id := range contacts {
 		client.requestProfile(id)
 	}
 
 	go client.networkLoop(events)
+	go func() {
+		t := time.NewTicker(presenceKeepaliveInterval)
+		defer t.Stop()
+		for range t.C {
+			if err := client.sendPresenceKeepalive(); err != nil {
+				client.addEvent("info", "presence keepalive failed: "+err.Error())
+			}
+		}
+	}()
 
 	tpl, err := pageTemplate()
 	if err != nil {
@@ -1398,12 +1610,15 @@ func main() {
 	mux.HandleFunc("/api/bootstrap", client.handleBootstrap)
 	mux.HandleFunc("/api/events", client.handleEvents)
 	mux.HandleFunc("/api/targets", client.handleTargets)
+	mux.HandleFunc("/api/groups", client.handleGroups)
 	mux.HandleFunc("/api/send", client.handleSend)
 	mux.HandleFunc("/api/friend/add", client.handleFriendAdd)
 	mux.HandleFunc("/api/friend/accept", client.handleFriendAccept)
+	mux.HandleFunc("/api/friend/ignore", client.handleFriendIgnore)
 	mux.HandleFunc("/api/profile/set", client.handleProfileSet)
 	mux.HandleFunc("/api/profile/get", client.handleProfileGet)
 	mux.HandleFunc("/api/presence/check", client.handlePresenceCheck)
+	mux.HandleFunc("/api/presence/set", client.handlePresenceSet)
 	mux.HandleFunc("/api/profile/card", client.handleProfileCard)
 
 	ln, err := net.Listen("tcp", *webAddr)

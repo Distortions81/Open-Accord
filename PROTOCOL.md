@@ -105,6 +105,7 @@ Common fields:
 - `channel_join`
 - `channel_leave`
 - `channel_send`
+- `presence_keepalive`
 
 ### Server-generated notifications
 - `deliver`
@@ -123,8 +124,22 @@ Common fields:
 
 ### `presence_get`
 - Required: `to`
-- Behavior: asks local server for current connection status of `to`.
-- Response: requester receives `presence_data(from=to, body=online|offline)`.
+- Behavior: asks local server for current presence state of `to`.
+- Response: requester receives `presence_data(from=to, body=json)`.
+  - JSON shape:
+    - `state`: `online|offline|invisible`
+    - `ttl_sec`: effective TTL used by server
+    - `updated_at`: unix seconds (optional)
+    - `expires_at`: unix seconds (optional)
+
+### `presence_keepalive`
+- Required: signed action fields + `body`
+- Body JSON:
+  - `visible` bool
+  - `ttl_sec` int
+- Server clamps `ttl_sec` to a bounded range before storing.
+- Presence is considered `online` while `now < expires_at` and `visible=true`.
+- Presence is `invisible` while `visible=false` (even if keepalives continue).
 
 ### Friend model
 - `friend_add`:
