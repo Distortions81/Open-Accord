@@ -58,14 +58,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	displayName, nicknames, err := loadProfile(*profilePath)
+	displayName, profileText, nicknames, err := loadProfile(*profilePath)
 	if err != nil {
 		fmt.Printf("profile load failed: %v\n", err)
 		os.Exit(1)
 	}
 	if strings.TrimSpace(displayName) == "" {
 		displayName = promptDisplayName(displayName)
-		if err := saveProfile(*profilePath, displayName, nicknames); err != nil {
+		if err := saveProfile(*profilePath, displayName, profileText, nicknames); err != nil {
 			fmt.Printf("profile save failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -91,6 +91,7 @@ func main() {
 		profilePath:  *profilePath,
 		keyPath:      *keyPath,
 		displayName:  displayName,
+		profileText:  profileText,
 		nicknames:    nicknames,
 		group:        strings.TrimSpace(*group),
 		channel:      strings.TrimSpace(*channel),

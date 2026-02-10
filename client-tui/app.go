@@ -63,7 +63,13 @@ type keyFile struct {
 
 type profileFile struct {
 	DisplayName   string          `json:"display_name"`
+	ProfileText   string          `json:"profile_text"`
 	PeerNicknames []savedNickname `json:"peer_nicknames"`
+}
+
+type profilePayload struct {
+	Nickname    string `json:"nickname,omitempty"`
+	ProfileText string `json:"profile_text,omitempty"`
 }
 
 type savedNickname struct {
@@ -131,6 +137,7 @@ type model struct {
 	profilePath  string
 	keyPath      string
 	displayName  string
+	profileText  string
 	nicknames    map[string]string
 
 	infoEntries []string
@@ -501,6 +508,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.addInfoEntry(line)
 			return m, waitNet(m.events)
+		case "profile_data":
+			decoded, err := decodeTextBodyForClient(msg.pkt)
+			if err != nil {
+				m.addInfoEntry("profile decode failed: " + err.Error())
+				return m, waitNet(m.events)
+			}
+			var prof profilePayload
+			if err := json.Unmarshal([]byte(decoded), &prof); err != nil {
+				m.addInfoEntry("profile parse failed")
+				return m, waitNet(m.events)
+			}
+			nick := strings.TrimSpace(prof.Nickname)
+			if nick != "" && looksLikeLoginID(msg.pkt.From) {
+				m.nicknames[msg.pkt.From] = nick
+				_ = saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames)
+			}
+			line := "profile " + m.displayPeer(msg.pkt.From)
+			if nick != "" {
+				line += " nick=" + nick
+			}
+			if strings.TrimSpace(prof.ProfileText) != "" {
+				line += " text=" + strings.TrimSpace(prof.ProfileText)
+			}
+			m.addInfoEntry(line)
+			return m, waitNet(m.events)
 		case "error":
 			m.addInfoEntry("server error: " + msg.pkt.Body)
 			return m, waitNet(m.events)
@@ -768,7 +800,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 	}
 	switch parts[0] {
 	case "/help":
-		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
+		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /profile /profile-get /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
 	case "/to", "/use", "/chat", "/dm":
 		if parts[0] == "/dm" && len(parts) < 2 {
 			return logLine(m.formatDMList())
@@ -871,6 +903,39 @@ func (m *model) handleCommand(line string) tea.Cmd {
 			return logLine("myname update failed: " + err.Error())
 		}
 		return logLine("display name set: " + m.displayName)
+	case "/profile":
+		if len(parts) < 2 {
+			return logLine("usage: /profile <text>")
+		}
+		text := strings.TrimSpace(strings.TrimPrefix(line, parts[0]))
+		if text == "" {
+			return logLine("profile text is required")
+		}
+		m.profileText = text
+		if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames); err != nil {
+			return logLine("profile update failed: " + err.Error())
+		}
+		payload := profilePayload{Nickname: m.displayName, ProfileText: m.profileText}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return logLine("profile encode failed: " + err.Error())
+		}
+		if err := m.sendSigned(Packet{Type: "profile_set", Body: string(b)}); err != nil {
+			return logLine("profile publish failed: " + err.Error())
+		}
+		return logLine("profile text updated")
+	case "/profile-get":
+		if len(parts) < 2 {
+			return logLine("usage: /profile-get <login_id|alias>")
+		}
+		target, ok := m.resolveRecipient(parts[1])
+		if !ok {
+			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+		}
+		if err := m.sendSigned(Packet{Type: "profile_get", To: target}); err != nil {
+			return logLine("profile-get failed: " + err.Error())
+		}
+		return logLine("profile requested for " + m.displayPeer(target))
 	case "/group":
 		if len(parts) < 2 {
 			return logLine("usage: /group <name>")
@@ -1053,7 +1118,15 @@ func (m *model) setNickname(loginID string, nickname string) error {
 	if err := m.ensureContact(loginID); err != nil {
 		return err
 	}
-	return saveProfile(m.profilePath, m.displayName, m.nicknames)
+	if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames); err != nil {
+		return err
+	}
+	payload := profilePayload{Nickname: m.displayName, ProfileText: m.profileText}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return m.sendSigned(Packet{Type: "profile_set", Body: string(b)})
 }
 
 func (m *model) setDisplayName(name string) error {
@@ -1062,7 +1135,15 @@ func (m *model) setDisplayName(name string) error {
 		return fmt.Errorf("display name required")
 	}
 	m.displayName = name
-	return saveProfile(m.profilePath, m.displayName, m.nicknames)
+	if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames); err != nil {
+		return err
+	}
+	payload := profilePayload{Nickname: m.displayName, ProfileText: m.profileText}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return m.sendSigned(Packet{Type: "profile_set", Body: string(b)})
 }
 
 func (m *model) ensureContact(loginID string) error {
@@ -1148,6 +1229,43 @@ func compressZlib(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func decodeTextBodyForClient(p Packet) (string, error) {
+	comp := strings.ToLower(strings.TrimSpace(p.Compression))
+	if comp == "" {
+		comp = compressionNone
+	}
+	switch comp {
+	case compressionNone:
+		if p.USize > 0 && p.USize != len(p.Body) {
+			return "", fmt.Errorf("usize mismatch")
+		}
+		return p.Body, nil
+	case compressionZlib:
+		if p.USize <= 0 {
+			return "", fmt.Errorf("usize required")
+		}
+		raw, err := base64.StdEncoding.DecodeString(p.Body)
+		if err != nil {
+			return "", err
+		}
+		zr, err := zlib.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return "", err
+		}
+		defer zr.Close()
+		decoded, err := io.ReadAll(io.LimitReader(zr, int64(p.USize)+1))
+		if err != nil {
+			return "", err
+		}
+		if len(decoded) != p.USize {
+			return "", fmt.Errorf("decoded size mismatch")
+		}
+		return string(decoded), nil
+	default:
+		return "", fmt.Errorf("unsupported compression")
+	}
+}
+
 func looksLikeLoginID(v string) bool {
 	if len(v) != 64 {
 		return false
@@ -1204,18 +1322,18 @@ func saveContacts(path string, contacts map[string]string) error {
 	return writeFileAtomic(path, payload, 0o600)
 }
 
-func loadProfile(path string) (string, map[string]string, error) {
+func loadProfile(path string) (string, string, map[string]string, error) {
 	nicks := make(map[string]string)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nicks, nil
+			return "", "", nicks, nil
 		}
-		return "", nil, err
+		return "", "", nil, err
 	}
 	var f profileFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	for _, n := range f.PeerNicknames {
 		id := strings.TrimSpace(n.LoginID)
@@ -1225,10 +1343,10 @@ func loadProfile(path string) (string, map[string]string, error) {
 		}
 		nicks[id] = nick
 	}
-	return strings.TrimSpace(f.DisplayName), nicks, nil
+	return strings.TrimSpace(f.DisplayName), strings.TrimSpace(f.ProfileText), nicks, nil
 }
 
-func saveProfile(path string, displayName string, nicknames map[string]string) error {
+func saveProfile(path string, displayName string, profileText string, nicknames map[string]string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -1237,7 +1355,7 @@ func saveProfile(path string, displayName string, nicknames map[string]string) e
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	f := profileFile{DisplayName: strings.TrimSpace(displayName), PeerNicknames: make([]savedNickname, 0, len(ids))}
+	f := profileFile{DisplayName: strings.TrimSpace(displayName), ProfileText: strings.TrimSpace(profileText), PeerNicknames: make([]savedNickname, 0, len(ids))}
 	for _, id := range ids {
 		nick := strings.TrimSpace(nicknames[id])
 		if nick == "" || !looksLikeLoginID(id) {

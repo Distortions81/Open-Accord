@@ -67,6 +67,11 @@ type Packet struct {
 	Caps          []string `json:"caps,omitempty"`
 }
 
+type profilePayload struct {
+	Nickname    string `json:"nickname,omitempty"`
+	ProfileText string `json:"profile_text,omitempty"`
+}
+
 type Conn struct {
 	conn net.Conn
 	enc  *json.Encoder
@@ -182,6 +187,7 @@ type Server struct {
 	friends      map[string]map[string]struct{}
 	friendAdds   map[string]map[string]struct{}
 	channels     map[string]*ChannelState
+	profiles     map[string]profilePayload
 
 	counter atomic.Uint64
 }
@@ -238,6 +244,7 @@ func NewServer(id, ownerPubKeyB64 string, ownerPriv ed25519.PrivateKey, advertis
 		friends:              make(map[string]map[string]struct{}),
 		friendAdds:           make(map[string]map[string]struct{}),
 		channels:             make(map[string]*ChannelState),
+		profiles:             make(map[string]profilePayload),
 	}
 }
 
@@ -317,7 +324,7 @@ func normalizedCompression(v string) string {
 
 func actionRequiresBody(typ string) bool {
 	switch typ {
-	case "send", "channel_send":
+	case "send", "channel_send", "profile_set":
 		return true
 	default:
 		return false
@@ -863,7 +870,7 @@ func (s *Server) sendToUser(to string, p Packet) bool {
 
 func isSignedActionType(typ string) bool {
 	switch typ {
-	case "send", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send":
+	case "send", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get":
 		return true
 	default:
 		return false
@@ -887,6 +894,10 @@ func validateSignedActionPacket(p Packet) bool {
 		return strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != ""
 	case "channel_send":
 		return strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" && strings.TrimSpace(p.Body) != ""
+	case "profile_set":
+		return strings.TrimSpace(p.Body) != ""
+	case "profile_get":
+		return strings.TrimSpace(p.To) != ""
 	default:
 		return false
 	}
@@ -1079,6 +1090,68 @@ func (s *Server) handleChannelSend(p Packet) {
 	}
 }
 
+func (s *Server) handleProfileSet(p Packet) {
+	var payload profilePayload
+	if err := json.Unmarshal([]byte(p.Body), &payload); err != nil {
+		return
+	}
+	payload.Nickname = strings.TrimSpace(payload.Nickname)
+	payload.ProfileText = strings.TrimSpace(payload.ProfileText)
+
+	s.mu.Lock()
+	s.profiles[p.From] = payload
+	s.mu.Unlock()
+
+	out := Packet{Type: "profile_data", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig}
+	if strings.TrimSpace(p.To) != "" {
+		s.notifyUserOrQueue(out)
+	} else {
+		s.notifyUserOrQueue(Packet{Type: "profile_data", ID: p.ID, From: p.From, To: p.From, Body: p.Body, Compression: p.Compression, USize: p.USize, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+	}
+}
+
+func (s *Server) handleProfileGet(p Packet) {
+	if strings.TrimSpace(p.To) == "" {
+		return
+	}
+	s.mu.RLock()
+	payload, ok := s.profiles[p.To]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	body, comp, usize, err := encodeBodyForRelay(string(bodyBytes))
+	if err != nil {
+		return
+	}
+	out := Packet{Type: "profile_data", ID: s.nextMessageID(), From: p.To, To: p.From, Body: body, Compression: comp, USize: usize, Origin: s.id}
+	s.notifyUserOrQueue(out)
+}
+
+func encodeBodyForRelay(body string) (string, string, int, error) {
+	if len(body) < 64 {
+		return body, compressionNone, 0, nil
+	}
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write([]byte(body)); err != nil {
+		_ = zw.Close()
+		return "", "", 0, err
+	}
+	if err := zw.Close(); err != nil {
+		return "", "", 0, err
+	}
+	enc := base64.StdEncoding.EncodeToString(buf.Bytes())
+	if len(enc) >= len(body) {
+		return body, compressionNone, 0, nil
+	}
+	return enc, compressionZlib, len(body), nil
+}
+
 func (s *Server) processSignedAction(p Packet) {
 	switch p.Type {
 	case "send":
@@ -1106,6 +1179,10 @@ func (s *Server) processSignedAction(p Packet) {
 	case "channel_send":
 		s.maybeRememberTopology(p)
 		s.handleChannelSend(p)
+	case "profile_set":
+		s.handleProfileSet(p)
+	case "profile_get":
+		s.handleProfileGet(p)
 	}
 }
 
