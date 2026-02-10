@@ -49,3 +49,7 @@ Optional flags:
 - Contacts are created automatically when you interact with a `login_id` or receive packets from a user.
 - Aliases default to short login-id prefixes; collisions get suffixes (`-2`, `-3`, ...).
 - Use `/remove-contact <alias>` to delete.
+
+## UI state persistence
+- TUI now persists known servers/channels and last chat context (DM or group/channel) to `<profile>.ui.json`.
+- This mirrors web UI behavior so context is restored on restart.

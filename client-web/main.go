@@ -209,6 +209,9 @@ type webClient struct {
 	nextSeq int64
 
 	counter atomic.Uint64
+
+	serverAddr   string
+	reconnecting bool
 }
 
 const (
@@ -223,6 +226,13 @@ const (
 )
 
 func stamp() string { return time.Now().Format("15:04:05") }
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 func (c *webClient) addEvent(kind string, text string) {
 	c.addEventWithActor(kind, text, "")
@@ -506,11 +516,7 @@ func messageMeta(p Packet) string {
 func (c *webClient) networkLoop(ch <-chan netMsg) {
 	for ev := range ch {
 		if ev.err != nil {
-			if errors.Is(ev.err, io.EOF) {
-				c.addEvent("info", "connection closed")
-			} else {
-				c.addEvent("info", "network error: "+ev.err.Error())
-			}
+			c.handleDisconnect(ev.err)
 			return
 		}
 		p := ev.pkt
@@ -535,7 +541,6 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			line := p.Body
 			if strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" {
 				c.rememberGroup(p.Group, p.Channel)
-				line = fmt.Sprintf("[%s/%s] %s", p.Group, p.Channel, line)
 			}
 			c.addEventWithActor("chat", line, p.From)
 			if meta := messageMeta(p); meta != "" {
@@ -666,6 +671,73 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			raw, _ := json.Marshal(p)
 			c.addEvent("info", "server: "+string(raw))
 		}
+	}
+}
+
+func (c *webClient) handleDisconnect(err error) {
+	if errors.Is(err, io.EOF) {
+		c.addEvent("info", "connection closed; reconnecting...")
+	} else {
+		c.addEvent("info", "network error: "+err.Error()+"; reconnecting...")
+	}
+	c.mu.Lock()
+	if c.reconnecting {
+		c.mu.Unlock()
+		return
+	}
+	c.reconnecting = true
+	c.mu.Unlock()
+	go c.reconnectLoop()
+}
+
+func (c *webClient) reconnectLoop() {
+	attempt := 0
+	for {
+		if attempt > 0 {
+			backoff := time.Second * time.Duration(1<<minInt(attempt, 5))
+			time.Sleep(backoff)
+		}
+		conn, enc, events, loginID, pubB64, err := runAuth(c.serverAddr, c.priv)
+		if err != nil {
+			attempt++
+			c.addEvent("info", fmt.Sprintf("reconnect failed (attempt %d): %v", attempt, err))
+			continue
+		}
+		if strings.TrimSpace(loginID) != c.loginID {
+			_ = conn.Close()
+			attempt++
+			c.addEvent("info", "reconnect rejected: login_id mismatch")
+			continue
+		}
+		c.mu.Lock()
+		oldConn := c.conn
+		c.conn = conn
+		c.enc = enc
+		c.pubB64 = pubB64
+		c.reconnecting = false
+		contacts := make([]string, 0, len(c.contacts))
+		for _, id := range c.contacts {
+			if looksLikeLoginID(id) && id != c.loginID {
+				contacts = append(contacts, id)
+			}
+		}
+		c.mu.Unlock()
+		if oldConn != nil && oldConn != conn {
+			_ = oldConn.Close()
+		}
+		c.addEvent("info", "reconnected")
+		go c.networkLoop(events)
+		if err := c.publishOwnProfile(); err != nil {
+			c.addEvent("info", "profile republish failed: "+err.Error())
+		}
+		if err := c.sendPresenceKeepalive(); err != nil {
+			c.addEvent("info", "presence keepalive failed: "+err.Error())
+		}
+		for _, id := range contacts {
+			c.requestProfile(id)
+			c.requestPresence(id)
+		}
+		return
 	}
 }
 
@@ -1986,6 +2058,7 @@ func main() {
 		lastContext:      savedCtx,
 		pendingPings:     make(map[string]int64),
 		seenChatIDs:      make(map[string]struct{}),
+		serverAddr:       *serverAddr,
 	}
 	for _, g := range savedGroups {
 		group := strings.TrimSpace(g.Name)

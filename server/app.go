@@ -1004,14 +1004,16 @@ func (s *Server) peerManager() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		addr := s.nextDialCandidate()
-		if addr == "" {
-			continue
+		for i := 0; i < 4; i++ {
+			addr := s.nextDialCandidate()
+			if addr == "" {
+				break
+			}
+			go func(target string) {
+				defer s.clearDialing(target)
+				s.dialPeer(target)
+			}(addr)
 		}
-		go func(target string) {
-			defer s.clearDialing(target)
-			s.dialPeer(target)
-		}(addr)
 	}
 }
 
@@ -1311,8 +1313,16 @@ func (s *Server) handleChannelInvite(p Packet) {
 	s.mu.Lock()
 	ch := s.channels[key]
 	if ch == nil {
-		s.mu.Unlock()
-		return
+		// Allow invite propagation across peers even if this node has not yet
+		// observed an explicit channel_create for the same channel.
+		ch = &ChannelState{
+			Owner:   p.From,
+			Public:  p.Public,
+			Members: make(map[string]struct{}),
+			Invites: make(map[string]string),
+		}
+		ch.Members[p.From] = struct{}{}
+		s.channels[key] = ch
 	}
 	_, inviterIsMember := ch.Members[p.From]
 	canInvite := ch.Public || inviterIsMember

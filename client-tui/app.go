@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -66,6 +67,23 @@ type profileFile struct {
 	ProfileText   string          `json:"profile_text"`
 	PeerNicknames []savedNickname `json:"peer_nicknames"`
 	PeerProfiles  []savedProfile  `json:"peer_profiles"`
+}
+
+type chatContext struct {
+	Mode    string `json:"mode,omitempty"` // dm|group
+	Target  string `json:"target,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Channel string `json:"channel,omitempty"`
+}
+
+type groupEntry struct {
+	Name     string   `json:"name"`
+	Channels []string `json:"channels,omitempty"`
+}
+
+type uiStateFile struct {
+	Groups      []groupEntry `json:"groups,omitempty"`
+	LastContext chatContext  `json:"last_context,omitempty"`
 }
 
 type profilePayload struct {
@@ -147,6 +165,15 @@ const (
 
 type presenceTickMsg struct{}
 
+type reconnectResultMsg struct {
+	conn    net.Conn
+	enc     *json.Encoder
+	events  <-chan netMsg
+	loginID string
+	pubB64  string
+	err     error
+}
+
 type model struct {
 	input textinput.Model
 
@@ -166,6 +193,7 @@ type model struct {
 	contacts          map[string]string
 	friends           map[string]struct{}
 	profilePath       string
+	uiStatePath       string
 	keyPath           string
 	displayName       string
 	profileText       string
@@ -178,6 +206,7 @@ type model struct {
 	presenceTTLSec    int
 	groups            map[string]map[string]struct{}
 	pendingInvites    map[string]pendingInvite
+	lastContext       chatContext
 
 	infoEntries []string
 	chatEntries []uiEntry
@@ -192,6 +221,10 @@ type model struct {
 	focusDirect  string
 	focusChannel string
 	panelChoices map[int]panelTarget
+	serverAddr   string
+	reconnecting bool
+	retryCount   int
+	closing      bool
 }
 
 func waitNet(ch <-chan netMsg) tea.Cmd {
@@ -214,6 +247,20 @@ func schedulePresenceTick() tea.Cmd {
 	})
 }
 
+func reconnectCmd(addr string, priv ed25519.PrivateKey, attempt int) tea.Cmd {
+	return func() tea.Msg {
+		if attempt > 0 {
+			backoff := time.Second * time.Duration(1<<minInt(attempt, 5))
+			time.Sleep(backoff)
+		}
+		conn, enc, events, loginID, pubB64, err := runAuth(addr, priv)
+		if err != nil {
+			return reconnectResultMsg{err: err}
+		}
+		return reconnectResultMsg{conn: conn, enc: enc, events: events, loginID: loginID, pubB64: pubB64}
+	}
+}
+
 func (m model) Init() tea.Cmd {
 	return tea.Batch(waitNet(m.events), textinput.Blink, schedulePresenceTick())
 }
@@ -228,15 +275,60 @@ func (m *model) addChatEntry(name string, body string, direct string, channel st
 		name = "unknown"
 	}
 	body = strings.TrimSpace(body)
-	if channel != "" {
-		m.chatEntries = append(m.chatEntries, uiEntry{line: fmt.Sprintf("%s %s [%s]: %s", stamp(), name, channel, body), direct: direct, channel: channel})
-		return
-	}
 	m.chatEntries = append(m.chatEntries, uiEntry{line: fmt.Sprintf("%s %s: %s", stamp(), name, body), direct: direct, channel: channel})
 }
 
 func groupChannelKey(group string, channel string) string {
 	return strings.TrimSpace(group) + "/" + strings.TrimSpace(channel)
+}
+
+func uiStatePathForProfile(profilePath string) string {
+	return strings.TrimSpace(profilePath) + ".ui.json"
+}
+
+func (m *model) currentContext() chatContext {
+	if strings.TrimSpace(m.group) != "" && strings.TrimSpace(m.channel) != "" {
+		return chatContext{
+			Mode:    "group",
+			Group:   strings.TrimSpace(m.group),
+			Channel: strings.TrimSpace(m.channel),
+		}
+	}
+	if strings.TrimSpace(m.to) != "" {
+		return chatContext{
+			Mode:   "dm",
+			Target: strings.TrimSpace(m.to),
+		}
+	}
+	return chatContext{}
+}
+
+func (m *model) groupsList() []groupEntry {
+	names := make([]string, 0, len(m.groups))
+	for g := range m.groups {
+		names = append(names, g)
+	}
+	sort.Strings(names)
+	out := make([]groupEntry, 0, len(names))
+	for _, g := range names {
+		channels := make([]string, 0, len(m.groups[g]))
+		for ch := range m.groups[g] {
+			if strings.TrimSpace(ch) != "" {
+				channels = append(channels, ch)
+			}
+		}
+		sort.Strings(channels)
+		out = append(out, groupEntry{Name: g, Channels: channels})
+	}
+	return out
+}
+
+func (m *model) persistUIState() {
+	if strings.TrimSpace(m.uiStatePath) == "" {
+		return
+	}
+	m.lastContext = m.currentContext()
+	_ = saveUIState(m.uiStatePath, m.groupsList(), m.lastContext)
 }
 
 func (m *model) rememberGroupChannel(group string, channel string) {
@@ -249,6 +341,7 @@ func (m *model) rememberGroupChannel(group string, channel string) {
 		m.groups[group] = make(map[string]struct{})
 	}
 	m.groups[group][channel] = struct{}{}
+	m.persistUIState()
 }
 
 func (m *model) displayPeer(loginID string) string {
@@ -356,6 +449,7 @@ func (m *model) applyFocus(t panelTarget) {
 		}
 		m.to = ""
 	}
+	m.persistUIState()
 }
 
 func (m *model) shouldShow(e uiEntry) bool {
@@ -527,7 +621,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
-			_ = m.conn.Close()
+			m.closing = true
+			if m.conn != nil {
+				_ = m.conn.Close()
+			}
 			return m, tea.Quit
 		case "up":
 			m.historyUp()
@@ -551,7 +648,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.pushHistory(line)
 			if line == "/quit" {
-				_ = m.conn.Close()
+				m.closing = true
+				if m.conn != nil {
+					_ = m.conn.Close()
+				}
 				return m, tea.Quit
 			}
 			if strings.HasPrefix(line, "/") {
@@ -560,7 +660,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			directCtx := ""
-			channelCtx := ""
 			if strings.TrimSpace(m.group) != "" || strings.TrimSpace(m.channel) != "" {
 				if strings.TrimSpace(m.group) == "" || strings.TrimSpace(m.channel) == "" {
 					return m, logLine("set both /group and /channel, or use /chat for direct messages")
@@ -568,8 +667,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err := m.sendSigned(Packet{Type: "channel_send", Group: m.group, Channel: m.channel, Body: line}); err != nil {
 					return m, tea.Batch(logLine("send error: "+err.Error()), tea.Quit)
 				}
-				channelCtx = m.group + "/" + m.channel
-				m.addChatEntry(m.displayName, line, directCtx, channelCtx)
+				// Channel sends are echoed back by the server to the sender.
+				// Avoid local append to prevent duplicate self-messages.
 				return m, nil
 			}
 
@@ -594,10 +693,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 	case netMsg:
 		if msg.err != nil {
-			if msg.err == io.EOF {
-				return m, tea.Batch(logLine("connection closed"), tea.Quit)
+			if m.closing {
+				return m, tea.Quit
 			}
-			return m, tea.Batch(logLine("network error: "+msg.err.Error()), tea.Quit)
+			if errors.Is(msg.err, io.EOF) {
+				m.addInfoEntry("connection closed; reconnecting...")
+			} else {
+				m.addInfoEntry("network error: " + msg.err.Error() + "; reconnecting...")
+			}
+			if !m.reconnecting {
+				m.reconnecting = true
+				m.retryCount = 0
+				return m, reconnectCmd(m.serverAddr, m.priv, m.retryCount)
+			}
+			return m, nil
 		}
 		_ = m.ensureContact(msg.pkt.From)
 		_ = m.ensureContact(msg.pkt.To)
@@ -659,7 +768,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.friends[other] = struct{}{}
 				}
 			}
-			if msg.pkt.Type == "channel_invite" && strings.TrimSpace(msg.pkt.Group) != "" && strings.TrimSpace(msg.pkt.Channel) != "" {
+			isInviteLikeUpdate := msg.pkt.Type == "channel_update" && strings.Contains(strings.ToLower(strings.TrimSpace(msg.pkt.Body)), "invite")
+			if (msg.pkt.Type == "channel_invite" || isInviteLikeUpdate) && strings.TrimSpace(msg.pkt.Group) != "" && strings.TrimSpace(msg.pkt.Channel) != "" {
 				key := groupChannelKey(msg.pkt.Group, msg.pkt.Channel)
 				m.pendingInvites[key] = pendingInvite{
 					From:      strings.TrimSpace(msg.pkt.From),
@@ -667,7 +777,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					Channel:   strings.TrimSpace(msg.pkt.Channel),
 					CreatedAt: time.Now().Unix(),
 				}
-				m.addInfoEntry(fmt.Sprintf("invite received: %s from %s (use /invite-accept %s)", key, m.displayPeer(msg.pkt.From), key))
+				m.addInfoEntry(fmt.Sprintf("INVITE: %s from %s (use /invite-accept %s)", key, m.displayPeer(msg.pkt.From), key))
+				m.addChatEntry("system", fmt.Sprintf("Invite to %s from %s (/invite-accept %s)", key, m.displayPeer(msg.pkt.From), key), "", "")
+			}
+			if msg.pkt.Type == "channel_joined" && strings.TrimSpace(msg.pkt.Group) != "" && strings.TrimSpace(msg.pkt.Channel) != "" {
+				delete(m.pendingInvites, groupChannelKey(msg.pkt.Group, msg.pkt.Channel))
 			}
 			line := fmt.Sprintf("[%s] from=%s to=%s", msg.pkt.Type, m.displayPeer(msg.pkt.From), m.displayPeer(msg.pkt.To))
 			if channelCtx != "" {
@@ -730,6 +844,48 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case localMsg:
 		m.addInfoEntry(msg.line)
 		return m, nil
+	case reconnectResultMsg:
+		if m.closing {
+			if msg.conn != nil {
+				_ = msg.conn.Close()
+			}
+			return m, tea.Quit
+		}
+		if msg.err != nil {
+			m.retryCount++
+			m.addInfoEntry(fmt.Sprintf("reconnect failed (attempt %d): %v", m.retryCount, msg.err))
+			return m, reconnectCmd(m.serverAddr, m.priv, m.retryCount)
+		}
+		if strings.TrimSpace(msg.loginID) != m.loginID {
+			if msg.conn != nil {
+				_ = msg.conn.Close()
+			}
+			m.retryCount++
+			m.addInfoEntry("reconnect rejected: login_id mismatch")
+			return m, reconnectCmd(m.serverAddr, m.priv, m.retryCount)
+		}
+		oldConn := m.conn
+		m.conn = msg.conn
+		m.enc = msg.enc
+		m.events = msg.events
+		m.pubB64 = msg.pubB64
+		m.reconnecting = false
+		m.retryCount = 0
+		if oldConn != nil && oldConn != m.conn {
+			_ = oldConn.Close()
+		}
+		m.addInfoEntry("reconnected")
+		if err := m.publishOwnProfile(); err != nil {
+			m.addInfoEntry("profile republish failed: " + err.Error())
+		}
+		if err := m.sendPresenceKeepalive(); err != nil {
+			m.addInfoEntry("presence keepalive failed: " + err.Error())
+		}
+		for _, id := range m.contacts {
+			m.requestProfile(id)
+			m.requestPresence(id)
+		}
+		return m, waitNet(m.events)
 	}
 
 	var cmd tea.Cmd
@@ -752,10 +908,18 @@ func (m model) View() string {
 	}
 
 	header := headerStyle.Render("goAccord TUI") + "  " +
-		statusStyle.Render("panel="+panelLabel+" login="+m.displayPeer(m.loginID)+" to="+emptyDash(m.displayPeer(m.to))+" group="+emptyDash(m.group)+" channel="+emptyDash(m.channel)+fmt.Sprintf(" contacts=%d friends=%d", len(m.contacts), len(m.friends)))
+		statusStyle.Render("panel="+panelLabel+" login="+m.displayPeer(m.loginID)+" to="+emptyDash(m.displayPeer(m.to))+" group="+emptyDash(m.group)+" channel="+emptyDash(m.channel)+fmt.Sprintf(" contacts=%d friends=%d invites=%d", len(m.contacts), len(m.friends), len(m.pendingInvites)))
 
 	if m.width > 0 {
 		m.input.Width = maxInt(10, m.width-4)
+	}
+
+	chatTitle := "all messages"
+	switch {
+	case strings.TrimSpace(m.group) != "" && strings.TrimSpace(m.channel) != "":
+		chatTitle = fmt.Sprintf("%s/%s", strings.TrimSpace(m.group), strings.TrimSpace(m.channel))
+	case strings.TrimSpace(m.to) != "":
+		chatTitle = fmt.Sprintf("%s direct message", m.displayPeer(m.to))
 	}
 
 	visible := make([]string, 0, len(m.chatEntries))
@@ -809,7 +973,7 @@ func (m model) View() string {
 	panelWidth := maxInt(20, m.width-2)
 	infoPanel := infoBoxStyle.Width(panelWidth).Render(infoBody)
 
-	chatPanel := chatBoxStyle.Width(panelWidth).Render(body)
+	chatPanel := chatBoxStyle.Width(panelWidth).Render("Chat: " + chatTitle + "\n" + body)
 
 	input := m.input.View()
 	return header + "\n" + infoPanel + "\n" + chatPanel + "\n" + input
@@ -1148,7 +1312,10 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		return logLine(m.formatIdentityHelp())
 	case "/switchid":
 		m.addInfoEntry("switch identity: client exiting, relaunch to choose/create identity")
-		_ = m.conn.Close()
+		m.closing = true
+		if m.conn != nil {
+			_ = m.conn.Close()
+		}
 		return tea.Quit
 	case "/remove-contact":
 		if len(parts) < 2 {
@@ -1269,12 +1436,14 @@ func (m *model) handleCommand(line string) tea.Cmd {
 			return logLine("usage: /group <name>")
 		}
 		m.group = strings.TrimSpace(parts[1])
+		m.persistUIState()
 		return logLine("group set: " + m.group)
 	case "/channel":
 		if len(parts) < 2 {
 			return logLine("usage: /channel <name>")
 		}
 		m.channel = strings.TrimSpace(parts[1])
+		m.persistUIState()
 		return logLine("channel set: " + m.channel)
 	case "/clearctx":
 		m.to = ""
@@ -1387,6 +1556,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if m.group == group && m.channel == channel {
 			m.group = ""
 			m.channel = ""
+			m.persistUIState()
 		}
 		return logLine("left: " + group + "/" + channel)
 	case "/channel-send":
@@ -1403,7 +1573,8 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if err := m.sendSigned(Packet{Type: "channel_send", Group: m.group, Channel: m.channel, Body: text}); err != nil {
 			return logLine("channel-send error: " + err.Error())
 		}
-		m.addChatEntry(m.displayName, text, "", m.group+"/"+m.channel)
+		// Channel sends are echoed back by the server to the sender.
+		// Avoid local append to prevent duplicate self-messages.
 		return nil
 	default:
 		return logLine("unknown command: " + parts[0])
@@ -1542,6 +1713,9 @@ func (m *model) removeContact(alias string) error {
 }
 
 func (m *model) sendSigned(p Packet) error {
+	if m.enc == nil {
+		return fmt.Errorf("not connected")
+	}
 	p.ID = m.nextMessageID()
 	p.From = m.loginID
 	p.PubKey = m.pubB64
@@ -1699,6 +1873,35 @@ func writeContactsAtomic(path string, contacts map[string]string) error {
 	return writeFileAtomic(path, payload, 0o600)
 }
 
+func loadUIState(path string) ([]groupEntry, chatContext, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, chatContext{}, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, chatContext{}, nil
+		}
+		return nil, chatContext{}, err
+	}
+	var f uiStateFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, chatContext{}, err
+	}
+	return f.Groups, f.LastContext, nil
+}
+
+func saveUIState(path string, groups []groupEntry, ctx chatContext) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	payload, err := json.MarshalIndent(uiStateFile{Groups: groups, LastContext: ctx}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, payload, 0o600)
+}
+
 func loadProfile(path string) (string, string, map[string]string, map[string]string, error) {
 	nicks := make(map[string]string)
 	peers := make(map[string]string)
@@ -1824,6 +2027,13 @@ func promptDisplayName(current string) string {
 
 func maxInt(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

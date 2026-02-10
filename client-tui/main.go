@@ -44,6 +44,7 @@ func main() {
 	if strings.TrimSpace(*profilePath) == "" {
 		*profilePath = filepath.Join(home, ".goaccord", "profiles", "profile-"+filepath.Base(strings.TrimSpace(*keyPath))+".json")
 	}
+	uiStatePath := uiStatePathForProfile(*profilePath)
 
 	selectedKeyPath, priv, conn, enc, events, loginID, pubB64, err := connectWithIdentitySelection(*addr, home, *keyPath)
 	if err != nil {
@@ -61,6 +62,11 @@ func main() {
 	displayName, profileText, nicknames, peerProfiles, err := loadProfile(*profilePath)
 	if err != nil {
 		fmt.Printf("profile load failed: %v\n", err)
+		os.Exit(1)
+	}
+	savedGroups, savedCtx, err := loadUIState(uiStatePath)
+	if err != nil {
+		fmt.Printf("ui state load failed: %v\n", err)
 		os.Exit(1)
 	}
 	if strings.TrimSpace(displayName) == "" {
@@ -89,6 +95,7 @@ func main() {
 		contacts:        contacts,
 		friends:         make(map[string]struct{}),
 		profilePath:     *profilePath,
+		uiStatePath:     uiStatePath,
 		keyPath:         *keyPath,
 		displayName:     displayName,
 		profileText:     profileText,
@@ -100,11 +107,26 @@ func main() {
 		presenceTTLSec:  defaultPresenceTTLSec,
 		groups:          make(map[string]map[string]struct{}),
 		pendingInvites:  make(map[string]pendingInvite),
+		lastContext:     savedCtx,
 		group:           strings.TrimSpace(*group),
 		channel:         strings.TrimSpace(*channel),
 		historyIndex:    -1,
 		focusMode:       panelAll,
 		panelChoices:    make(map[int]panelTarget),
+		serverAddr:      *addr,
+	}
+	for _, g := range savedGroups {
+		group := strings.TrimSpace(g.Name)
+		if group == "" {
+			continue
+		}
+		if len(g.Channels) == 0 {
+			m.rememberGroupChannel(group, "default")
+			continue
+		}
+		for _, ch := range g.Channels {
+			m.rememberGroupChannel(group, ch)
+		}
 	}
 
 	m.addInfoEntry("connected to " + *addr)
@@ -120,12 +142,15 @@ func main() {
 		m.addInfoEntry("presence keepalive failed: " + err.Error())
 	}
 
+	appliedFromFlags := false
 	if initialTo := strings.TrimSpace(*to); initialTo != "" {
 		if resolved, ok := m.resolveRecipient(initialTo); ok {
 			m.to = resolved
 			m.applyFocus(panelTarget{mode: panelDirect, direct: resolved})
 			m.requestProfile(resolved)
+			m.requestPresence(resolved)
 			m.addInfoEntry("initial recipient: " + m.displayPeer(resolved))
+			appliedFromFlags = true
 		} else {
 			m.addInfoEntry("unknown initial recipient: " + initialTo)
 		}
@@ -139,6 +164,23 @@ func main() {
 	if strings.TrimSpace(*group) != "" && strings.TrimSpace(*channel) != "" {
 		m.rememberGroupChannel(strings.TrimSpace(*group), strings.TrimSpace(*channel))
 		m.applyFocus(panelTarget{mode: panelChannel, channel: strings.TrimSpace(*group) + "/" + strings.TrimSpace(*channel)})
+		appliedFromFlags = true
+	}
+	if !appliedFromFlags {
+		if savedCtx.Mode == "group" && strings.TrimSpace(savedCtx.Group) != "" {
+			ch := strings.TrimSpace(savedCtx.Channel)
+			if ch == "" {
+				ch = "default"
+			}
+			m.rememberGroupChannel(savedCtx.Group, ch)
+			m.applyFocus(panelTarget{mode: panelChannel, channel: savedCtx.Group + "/" + ch})
+		} else if savedCtx.Mode == "dm" && looksLikeLoginID(strings.TrimSpace(savedCtx.Target)) {
+			target := strings.TrimSpace(savedCtx.Target)
+			m.to = target
+			m.applyFocus(panelTarget{mode: panelDirect, direct: target})
+			m.requestProfile(target)
+			m.requestPresence(target)
+		}
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
