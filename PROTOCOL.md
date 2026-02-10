@@ -37,6 +37,8 @@ Signed action payload (JSON object):
   "from": "...",
   "to": "...",
   "body": "...",
+  "compression": "none",
+  "usize": 0,
   "group": "...",
   "channel": "...",
   "public": false
@@ -54,6 +56,8 @@ Common fields:
 - `from` string
 - `to` string
 - `body` string
+- `compression` string (`none` or `zlib`)
+- `usize` number (uncompressed size, required when compressed)
 - `group` string
 - `channel` string
 - `public` bool
@@ -165,7 +169,9 @@ Signed action packets are dropped if:
 
 ## Policy and Limits
 Defaults:
-- `max_msg_bytes`: 16384
+- `max_msg_bytes`: 32768
+- `max_uncompressed_bytes`: 65536
+- `max_expand_ratio`: 64
 - `max_msgs_per_sec`: 50
 - `burst`: 100
 - `max_seen`: 20000

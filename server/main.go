@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/zlib"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,22 +21,27 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	defaultMaxMessageBytes = 16 * 1024
-	defaultMaxMsgsPerSec   = 50
-	defaultBurstMessages   = 100
-	defaultMaxSeenEntries  = 20000
-	defaultMaxKnownAddrs   = 5000
-	defaultKnownAddrTTL    = 30 * time.Minute
-	defaultPeerBanScore    = 20
-	defaultPeerBanFor      = 10 * time.Minute
-	clientModeDisabled     = "disabled"
-	clientModePublic       = "public"
-	clientModePrivate      = "private"
-	persistenceModeLive    = "live"
-	persistenceModePersist = "persist"
+	defaultMaxMessageBytes      = 32 * 1024
+	defaultMaxUncompressedBytes = 64 * 1024
+	defaultMaxExpandRatio       = 64
+	defaultMaxMsgsPerSec        = 50
+	defaultBurstMessages        = 100
+	defaultMaxSeenEntries       = 20000
+	defaultMaxKnownAddrs        = 5000
+	defaultKnownAddrTTL         = 30 * time.Minute
+	defaultPeerBanScore         = 20
+	defaultPeerBanFor           = 10 * time.Minute
+	clientModeDisabled          = "disabled"
+	clientModePublic            = "public"
+	clientModePrivate           = "private"
+	persistenceModeLive         = "live"
+	persistenceModePersist      = "persist"
+	compressionNone             = "none"
+	compressionZlib             = "zlib"
 )
 
 type Packet struct {
@@ -44,6 +51,8 @@ type Packet struct {
 	From          string   `json:"from,omitempty"`
 	To            string   `json:"to,omitempty"`
 	Body          string   `json:"body,omitempty"`
+	Compression   string   `json:"compression,omitempty"`
+	USize         int      `json:"usize,omitempty"`
 	Group         string   `json:"group,omitempty"`
 	Channel       string   `json:"channel,omitempty"`
 	Public        bool     `json:"public,omitempty"`
@@ -72,14 +81,16 @@ func (c *Conn) Send(p Packet) error {
 }
 
 type signedAction struct {
-	Type    string `json:"type"`
-	ID      string `json:"id"`
-	From    string `json:"from"`
-	To      string `json:"to,omitempty"`
-	Body    string `json:"body,omitempty"`
-	Group   string `json:"group,omitempty"`
-	Channel string `json:"channel,omitempty"`
-	Public  bool   `json:"public,omitempty"`
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	From        string `json:"from"`
+	To          string `json:"to,omitempty"`
+	Body        string `json:"body,omitempty"`
+	Compression string `json:"compression,omitempty"`
+	USize       int    `json:"usize,omitempty"`
+	Group       string `json:"group,omitempty"`
+	Channel     string `json:"channel,omitempty"`
+	Public      bool   `json:"public,omitempty"`
 }
 
 type keyFile struct {
@@ -138,27 +149,29 @@ func (rl *rateLimiter) Allow() bool {
 }
 
 type Server struct {
-	id              string
-	ownerPubKeyB64  string
-	ownerPriv       ed25519.PrivateKey
-	advertiseAddr   string
-	maxPeerSessions int
-	maxMessageBytes int
-	maxMsgsPerSec   int
-	burstMessages   int
-	maxSeenEntries  int
-	maxKnownAddrs   int
-	knownAddrTTL    time.Duration
-	relayEnabled    bool
-	clientMode      string
-	clientAllow     map[string]struct{}
-	persistenceMode string
-	persistAutoHost bool
-	maxPendingMsgs  int
-	store           *sqliteStore
+	id                   string
+	ownerPubKeyB64       string
+	ownerPriv            ed25519.PrivateKey
+	advertiseAddr        string
+	maxPeerSessions      int
+	maxMessageBytes      int
+	maxUncompressedBytes int
+	maxExpandRatio       int
+	maxMsgsPerSec        int
+	burstMessages        int
+	maxSeenEntries       int
+	maxKnownAddrs        int
+	knownAddrTTL         time.Duration
+	relayEnabled         bool
+	clientMode           string
+	clientAllow          map[string]struct{}
+	persistenceMode      string
+	persistAutoHost      bool
+	maxPendingMsgs       int
+	store                *sqliteStore
 
 	mu           sync.RWMutex
-	users        map[string]*Conn
+	users        map[string]map[*Conn]struct{}
 	peers        map[string]*Peer
 	seen         map[string]time.Time
 	knownAddrs   map[string]time.Time
@@ -195,35 +208,37 @@ func NewServer(id, ownerPubKeyB64 string, ownerPriv ed25519.PrivateKey, advertis
 	}
 
 	return &Server{
-		id:              id,
-		ownerPubKeyB64:  ownerPubKeyB64,
-		ownerPriv:       ownerPriv,
-		advertiseAddr:   normalizeAddr(advertiseAddr),
-		maxPeerSessions: maxPeerSessions,
-		maxMessageBytes: maxMessageBytes,
-		maxMsgsPerSec:   maxMsgsPerSec,
-		burstMessages:   burstMessages,
-		maxSeenEntries:  maxSeenEntries,
-		maxKnownAddrs:   maxKnownAddrs,
-		knownAddrTTL:    knownAddrTTL,
-		relayEnabled:    true,
-		clientMode:      clientModePublic,
-		clientAllow:     make(map[string]struct{}),
-		persistenceMode: persistenceModeLive,
-		persistAutoHost: true,
-		maxPendingMsgs:  500,
-		users:           make(map[string]*Conn),
-		peers:           make(map[string]*Peer),
-		seen:            make(map[string]time.Time),
-		knownAddrs:      make(map[string]time.Time),
-		dialing:         make(map[string]struct{}),
-		peerScore:       make(map[string]int),
-		peerBanned:      make(map[string]time.Time),
-		peerBanScore:    defaultPeerBanScore,
-		peerBanFor:      defaultPeerBanFor,
-		friends:         make(map[string]map[string]struct{}),
-		friendAdds:      make(map[string]map[string]struct{}),
-		channels:        make(map[string]*ChannelState),
+		id:                   id,
+		ownerPubKeyB64:       ownerPubKeyB64,
+		ownerPriv:            ownerPriv,
+		advertiseAddr:        normalizeAddr(advertiseAddr),
+		maxPeerSessions:      maxPeerSessions,
+		maxMessageBytes:      maxMessageBytes,
+		maxUncompressedBytes: defaultMaxUncompressedBytes,
+		maxExpandRatio:       defaultMaxExpandRatio,
+		maxMsgsPerSec:        maxMsgsPerSec,
+		burstMessages:        burstMessages,
+		maxSeenEntries:       maxSeenEntries,
+		maxKnownAddrs:        maxKnownAddrs,
+		knownAddrTTL:         knownAddrTTL,
+		relayEnabled:         true,
+		clientMode:           clientModePublic,
+		clientAllow:          make(map[string]struct{}),
+		persistenceMode:      persistenceModeLive,
+		persistAutoHost:      true,
+		maxPendingMsgs:       500,
+		users:                make(map[string]map[*Conn]struct{}),
+		peers:                make(map[string]*Peer),
+		seen:                 make(map[string]time.Time),
+		knownAddrs:           make(map[string]time.Time),
+		dialing:              make(map[string]struct{}),
+		peerScore:            make(map[string]int),
+		peerBanned:           make(map[string]time.Time),
+		peerBanScore:         defaultPeerBanScore,
+		peerBanFor:           defaultPeerBanFor,
+		friends:              make(map[string]map[string]struct{}),
+		friendAdds:           make(map[string]map[string]struct{}),
+		channels:             make(map[string]*ChannelState),
 	}
 }
 
@@ -293,6 +308,82 @@ func (s *Server) readPacket(reader *bufio.Reader, rl *rateLimiter, out *Packet) 
 	}
 }
 
+func normalizedCompression(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return compressionNone
+	}
+	return v
+}
+
+func actionRequiresBody(typ string) bool {
+	switch typ {
+	case "send", "channel_send":
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeTextBody(p Packet, maxCompressed int, maxUncompressed int, maxExpandRatio int) (string, error) {
+	comp := normalizedCompression(p.Compression)
+	switch comp {
+	case compressionNone:
+		if maxUncompressed > 0 && len(p.Body) > maxUncompressed {
+			return "", fmt.Errorf("body exceeds max uncompressed size")
+		}
+		if p.USize > 0 && p.USize != len(p.Body) {
+			return "", fmt.Errorf("usize mismatch for uncompressed body")
+		}
+		if !utf8.ValidString(p.Body) {
+			return "", fmt.Errorf("body is not valid utf-8")
+		}
+		return p.Body, nil
+	case compressionZlib:
+		if p.USize <= 0 {
+			return "", fmt.Errorf("usize required for zlib body")
+		}
+		if maxUncompressed > 0 && p.USize > maxUncompressed {
+			return "", fmt.Errorf("usize exceeds max uncompressed size")
+		}
+		raw, err := base64.StdEncoding.DecodeString(p.Body)
+		if err != nil {
+			return "", fmt.Errorf("invalid zlib body encoding")
+		}
+		if len(raw) == 0 {
+			return "", fmt.Errorf("empty zlib body")
+		}
+		if maxCompressed > 0 && len(raw) > maxCompressed {
+			return "", fmt.Errorf("compressed body exceeds max size")
+		}
+		zr, err := zlib.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return "", fmt.Errorf("invalid zlib stream")
+		}
+		defer zr.Close()
+
+		limited := io.LimitReader(zr, int64(maxUncompressed)+1)
+		decoded, err := io.ReadAll(limited)
+		if err != nil {
+			return "", fmt.Errorf("zlib decode failed")
+		}
+		if maxUncompressed > 0 && len(decoded) > maxUncompressed {
+			return "", fmt.Errorf("decoded body exceeds max uncompressed size")
+		}
+		if len(decoded) != p.USize {
+			return "", fmt.Errorf("decoded size mismatch")
+		}
+		if maxExpandRatio > 0 && len(raw) > 0 && len(decoded) > len(raw)*maxExpandRatio {
+			return "", fmt.Errorf("decoded/compressed ratio exceeds limit")
+		}
+		if !utf8.Valid(decoded) {
+			return "", fmt.Errorf("decoded body is not valid utf-8")
+		}
+		return string(decoded), nil
+	default:
+		return "", fmt.Errorf("unsupported compression")
+	}
+}
 func capsToMap(caps []string) map[string]struct{} {
 	m := make(map[string]struct{}, len(caps))
 	for _, c := range caps {
@@ -423,7 +514,7 @@ func verifyServerIdentity(serverID, pubKeyB64, sigB64 string) bool {
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Public: p.Public})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public})
 	if err != nil {
 		return "", err
 	}
@@ -443,7 +534,7 @@ func verifyActionSignature(p Packet) bool {
 	if err != nil || len(sigRaw) != ed25519.SignatureSize {
 		return false
 	}
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Public: p.Public})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public})
 	if err != nil {
 		return false
 	}
@@ -699,21 +790,23 @@ func (s *Server) peerManager() {
 	}
 }
 
-func (s *Server) addUser(name string, c *Conn) bool {
+func (s *Server) addUser(name string, c *Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.users[name]; exists {
-		return false
+	if s.users[name] == nil {
+		s.users[name] = make(map[*Conn]struct{})
 	}
-	s.users[name] = c
-	return true
+	s.users[name][c] = struct{}{}
 }
 
 func (s *Server) removeUser(name string, c *Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.users[name]; ok && existing == c {
-		delete(s.users, name)
+	if existing, ok := s.users[name]; ok {
+		delete(existing, c)
+		if len(existing) == 0 {
+			delete(s.users, name)
+		}
 	}
 }
 
@@ -749,16 +842,24 @@ func (s *Server) removePeer(peerID string, c *Conn) {
 
 func (s *Server) sendToUser(to string, p Packet) bool {
 	s.mu.RLock()
-	user := s.users[to]
+	conns := s.users[to]
+	list := make([]*Conn, 0, len(conns))
+	for c := range conns {
+		list = append(list, c)
+	}
 	s.mu.RUnlock()
-	if user == nil {
+	if len(list) == 0 {
 		return false
 	}
-	if err := user.Send(p); err != nil {
-		log.Printf("deliver to user %q failed: %v", to, err)
-		return false
+	delivered := false
+	for _, c := range list {
+		if err := c.Send(p); err != nil {
+			log.Printf("deliver to user %q failed: %v", to, err)
+			continue
+		}
+		delivered = true
 	}
-	return true
+	return delivered
 }
 
 func isSignedActionType(typ string) bool {
@@ -1157,11 +1258,7 @@ func (s *Server) authenticateUser(c *Conn, reader *bufio.Reader, claimedPubKey s
 }
 
 func (s *Server) handleUser(loginID string, c *Conn, reader *bufio.Reader, rl *rateLimiter) {
-	if !s.addUser(loginID, c) {
-		_ = c.Send(Packet{Type: "error", Body: "login id already connected"})
-		_ = c.conn.Close()
-		return
-	}
+	s.addUser(loginID, c)
 	defer func() {
 		s.removeUser(loginID, c)
 		_ = c.conn.Close()
@@ -1201,7 +1298,18 @@ func (s *Server) handleUserPacket(sender string, p Packet) {
 		return
 	}
 
-	s.processSignedAction(p)
+	local := p
+	if actionRequiresBody(p.Type) {
+		decoded, err := decodeTextBody(p, s.maxMessageBytes, s.maxUncompressedBytes, s.maxExpandRatio)
+		if err != nil {
+			return
+		}
+		local.Body = decoded
+		local.Compression = compressionNone
+		local.USize = 0
+	}
+
+	s.processSignedAction(local)
 	if s.relayEnabled {
 		s.floodToPeers("", p)
 	}
@@ -1281,7 +1389,20 @@ func (s *Server) handlePeerPacket(fromPeer, peerAddr string, c *Conn, p Packet) 
 		if !s.markSeen(p.ID) {
 			return true
 		}
-		s.processSignedAction(p)
+		local := p
+		if actionRequiresBody(p.Type) {
+			decoded, err := decodeTextBody(p, s.maxMessageBytes, s.maxUncompressedBytes, s.maxExpandRatio)
+			if err != nil {
+				if s.penalizePeer(peerAddr, 3, "invalid compressed body") {
+					return false
+				}
+				return true
+			}
+			local.Body = decoded
+			local.Compression = compressionNone
+			local.USize = 0
+		}
+		s.processSignedAction(local)
 		if s.relayEnabled {
 			s.floodToPeers(fromPeer, p)
 		}
@@ -1420,6 +1541,8 @@ func main() {
 	peersCSV := flag.String("peers", "", "comma-separated seed peer addresses (host:port)")
 	maxPeers := flag.Int("max-peers", 32, "maximum concurrent peer sessions")
 	maxMsgBytes := flag.Int("max-msg-bytes", defaultMaxMessageBytes, "maximum accepted packet size in bytes")
+	maxUncompressedBytes := flag.Int("max-uncompressed-bytes", defaultMaxUncompressedBytes, "maximum accepted uncompressed text body size in bytes")
+	maxExpandRatio := flag.Int("max-expand-ratio", defaultMaxExpandRatio, "maximum decoded/compressed size ratio for compressed bodies")
 	maxMsgsPerSec := flag.Int("max-msgs-per-sec", defaultMaxMsgsPerSec, "maximum accepted packets per second per connection")
 	burstMessages := flag.Int("burst", defaultBurstMessages, "burst packet allowance per connection")
 	maxSeen := flag.Int("max-seen", defaultMaxSeenEntries, "maximum dedupe IDs kept in memory")
@@ -1471,6 +1594,8 @@ func main() {
 		*knownAddrTTL,
 	)
 
+	s.maxUncompressedBytes = *maxUncompressedBytes
+	s.maxExpandRatio = *maxExpandRatio
 	s.relayEnabled = *relayEnabled
 	mode := strings.ToLower(strings.TrimSpace(*clientMode))
 	switch mode {
@@ -1543,7 +1668,7 @@ func main() {
 	}
 	log.Printf("server %q listening on %s", s.id, *listenAddr)
 	log.Printf("owner login_id %q (key: %s)", ownerLoginID, *ownerKeyPath)
-	log.Printf("limits: max-msg-bytes=%d max-msgs-per-sec=%d burst=%d max-seen=%d max-known-addrs=%d known-addr-ttl=%s", s.maxMessageBytes, s.maxMsgsPerSec, s.burstMessages, s.maxSeenEntries, s.maxKnownAddrs, s.knownAddrTTL)
+	log.Printf("limits: max-msg-bytes=%d max-uncompressed-bytes=%d max-expand-ratio=%d max-msgs-per-sec=%d burst=%d max-seen=%d max-known-addrs=%d known-addr-ttl=%s", s.maxMessageBytes, s.maxUncompressedBytes, s.maxExpandRatio, s.maxMsgsPerSec, s.burstMessages, s.maxSeenEntries, s.maxKnownAddrs, s.knownAddrTTL)
 	if s.advertiseAddr != "" {
 		log.Printf("advertising as %s", s.advertiseAddr)
 	}

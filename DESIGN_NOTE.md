@@ -98,7 +98,10 @@ Phase: Live-only mesh by default, with optional persistence mode.
 - Keep configurable ingress rate limits.
   - Existing examples: `--max-msgs-per-sec`, `--burst`.
 - Keep a hard maximum packet size and ignore anything larger.
-  - Recommended default: `16 KiB` serialized packet size.
+  - Current default: `32 KiB` serialized packet size.
+- Support optional body compression (`zlib` or `none`) with bounded expansion checks.
+  - Current defaults: `max_uncompressed_bytes=64 KiB`, `max_expand_ratio=64`.
+  - Oversized decoded payloads are dropped.
 
 ## Capabilities (Current)
 - Peers advertise capability flags during handshake (`caps`).

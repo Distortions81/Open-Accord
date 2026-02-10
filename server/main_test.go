@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -253,9 +255,9 @@ func waitForUserDisconnected(t *testing.T, s *Server, loginID string, timeout ti
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		s.mu.RLock()
-		_, ok := s.users[loginID]
+		conns, ok := s.users[loginID]
 		s.mu.RUnlock()
-		if !ok {
+		if !ok || len(conns) == 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -640,4 +642,86 @@ func TestPublicChannelAllowsAnyUserToInviteAndJoin(t *testing.T) {
 		}
 	}
 	t.Fatalf("channel message not delivered to joined member")
+}
+
+func compressBodyForTest(t *testing.T, s string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write([]byte(s)); err != nil {
+		t.Fatalf("zlib write failed: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zlib close failed: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func TestCompressedDirectMessageDelivery(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+	bob := newTestClient(t, addr)
+	defer bob.close()
+
+	body := strings.Repeat("compressible-text-", 20)
+	alice.sendAction(t, Packet{Type: "send", To: bob.loginID, Body: compressBodyForTest(t, body), Compression: compressionZlib, USize: len(body)})
+
+	p := bob.recv(t, 2*time.Second)
+	if p.Type != "deliver" {
+		t.Fatalf("expected deliver, got: %+v", p)
+	}
+	if p.Body != body {
+		t.Fatalf("unexpected decoded body: got=%q want=%q", p.Body, body)
+	}
+}
+
+func TestCompressedBodyRejectsOversizedDecoded(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+	bob := newTestClient(t, addr)
+	defer bob.close()
+
+	body := strings.Repeat("A", defaultMaxUncompressedBytes+128)
+	alice.sendAction(t, Packet{Type: "send", To: bob.loginID, Body: compressBodyForTest(t, body), Compression: compressionZlib, USize: len(body)})
+
+	if p, err := bob.recvMaybe(400 * time.Millisecond); err == nil {
+		t.Fatalf("expected no delivery for oversized decoded body, got: %+v", p)
+	}
+}
+
+func TestMultipleSessionsSameLoginReceiveDelivery(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+
+	_, bobPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("bob key generation failed: %v", err)
+	}
+	bobA := newTestClientWithKey(t, addr, bobPriv)
+	defer bobA.close()
+	bobB := newTestClientWithKey(t, addr, bobPriv)
+	defer bobB.close()
+
+	alice.send(t, bobA.loginID, "hello-both")
+
+	msgA := bobA.recv(t, 2*time.Second)
+	msgB := bobB.recv(t, 2*time.Second)
+	if msgA.Type != "deliver" || msgB.Type != "deliver" {
+		t.Fatalf("expected deliver on both sessions, got A=%+v B=%+v", msgA, msgB)
+	}
+	if msgA.Body != "hello-both" || msgB.Body != "hello-both" {
+		t.Fatalf("unexpected message body A=%+v B=%+v", msgA, msgB)
+	}
 }

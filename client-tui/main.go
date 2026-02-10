@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"compress/zlib"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -24,30 +28,34 @@ import (
 )
 
 type Packet struct {
-	Type    string `json:"type"`
-	Role    string `json:"role,omitempty"`
-	ID      string `json:"id,omitempty"`
-	From    string `json:"from,omitempty"`
-	To      string `json:"to,omitempty"`
-	Body    string `json:"body,omitempty"`
-	Group   string `json:"group,omitempty"`
-	Channel string `json:"channel,omitempty"`
-	Public  bool   `json:"public,omitempty"`
-	Origin  string `json:"origin,omitempty"`
-	Nonce   string `json:"nonce,omitempty"`
-	PubKey  string `json:"pub_key,omitempty"`
-	Sig     string `json:"sig,omitempty"`
+	Type        string `json:"type"`
+	Role        string `json:"role,omitempty"`
+	ID          string `json:"id,omitempty"`
+	From        string `json:"from,omitempty"`
+	To          string `json:"to,omitempty"`
+	Body        string `json:"body,omitempty"`
+	Compression string `json:"compression,omitempty"`
+	USize       int    `json:"usize,omitempty"`
+	Group       string `json:"group,omitempty"`
+	Channel     string `json:"channel,omitempty"`
+	Public      bool   `json:"public,omitempty"`
+	Origin      string `json:"origin,omitempty"`
+	Nonce       string `json:"nonce,omitempty"`
+	PubKey      string `json:"pub_key,omitempty"`
+	Sig         string `json:"sig,omitempty"`
 }
 
 type signedAction struct {
-	Type    string `json:"type"`
-	ID      string `json:"id"`
-	From    string `json:"from"`
-	To      string `json:"to,omitempty"`
-	Body    string `json:"body,omitempty"`
-	Group   string `json:"group,omitempty"`
-	Channel string `json:"channel,omitempty"`
-	Public  bool   `json:"public,omitempty"`
+	Type        string `json:"type"`
+	ID          string `json:"id"`
+	From        string `json:"from"`
+	To          string `json:"to,omitempty"`
+	Body        string `json:"body,omitempty"`
+	Compression string `json:"compression,omitempty"`
+	USize       int    `json:"usize,omitempty"`
+	Group       string `json:"group,omitempty"`
+	Channel     string `json:"channel,omitempty"`
+	Public      bool   `json:"public,omitempty"`
 }
 
 type keyFile struct {
@@ -71,6 +79,12 @@ type netMsg struct {
 type localMsg struct {
 	line string
 }
+
+const (
+	compressionNone  = "none"
+	compressionZlib  = "zlib"
+	compressMinBytes = 64
+)
 
 type model struct {
 	input textinput.Model
@@ -444,6 +458,15 @@ func (m *model) sendSigned(p Packet) error {
 	p.ID = m.nextMessageID()
 	p.From = m.loginID
 	p.PubKey = m.pubB64
+	if strings.TrimSpace(p.Body) != "" {
+		body, comp, usize, err := encodeBodyForSend(p.Body)
+		if err != nil {
+			return err
+		}
+		p.Body = body
+		p.Compression = comp
+		p.USize = usize
+	}
 	sig, err := signAction(m.priv, p)
 	if err != nil {
 		return err
@@ -452,6 +475,33 @@ func (m *model) sendSigned(p Packet) error {
 	return m.enc.Encode(p)
 }
 
+func encodeBodyForSend(body string) (string, string, int, error) {
+	if len(body) < compressMinBytes {
+		return body, compressionNone, 0, nil
+	}
+	compressed, err := compressZlib([]byte(body))
+	if err != nil {
+		return "", "", 0, err
+	}
+	encoded := base64.StdEncoding.EncodeToString(compressed)
+	if len(encoded) >= len(body) {
+		return body, compressionNone, 0, nil
+	}
+	return encoded, compressionZlib, len(body), nil
+}
+
+func compressZlib(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		_ = zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
 func looksLikeLoginID(v string) bool {
 	if len(v) != 64 {
 		return false
@@ -505,7 +555,7 @@ func saveContacts(path string, contacts map[string]string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, payload, 0o600)
+	return writeFileAtomic(path, payload, 0o600)
 }
 
 func maxInt(a, b int) int {
@@ -566,14 +616,14 @@ func loadOrCreateKey(path string) (ed25519.PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
+	if err := writeFileAtomic(path, payload, 0o600); err != nil {
 		return nil, err
 	}
 	return priv, nil
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
-	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Public: p.Public})
+	msg, err := json.Marshal(signedAction{Type: p.Type, ID: p.ID, From: p.From, To: p.To, Body: p.Body, Compression: p.Compression, USize: p.USize, Group: p.Group, Channel: p.Channel, Public: p.Public})
 	if err != nil {
 		return "", err
 	}
@@ -656,6 +706,169 @@ func (m *model) nextMessageID() string {
 	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), n)
 }
 
+type identityCandidate struct {
+	Path    string
+	LoginID string
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		if err != nil {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+func listIdentityCandidates(home string, currentPath string) []identityCandidate {
+	seen := make(map[string]struct{})
+	paths := make([]string, 0)
+	addPath := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if _, ok := seen[p]; ok {
+			return
+		}
+		seen[p] = struct{}{}
+		paths = append(paths, p)
+	}
+	addPath(currentPath)
+
+	legacy := filepath.Join(home, ".goaccord", "ed25519_key.json")
+	addPath(legacy)
+
+	idsDir := filepath.Join(home, ".goaccord", "identities")
+	if entries, err := os.ReadDir(idsDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+				continue
+			}
+			addPath(filepath.Join(idsDir, e.Name()))
+		}
+	}
+
+	out := make([]identityCandidate, 0, len(paths))
+	for _, p := range paths {
+		priv, err := loadOrCreateKey(p)
+		if err != nil {
+			continue
+		}
+		pub := priv.Public().(ed25519.PublicKey)
+		out = append(out, identityCandidate{Path: p, LoginID: loginIDForPubKey(pub)})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path == currentPath {
+			return true
+		}
+		if out[j].Path == currentPath {
+			return false
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
+
+func promptIdentityPath(home string, currentPath string) (string, error) {
+	candidates := listIdentityCandidates(home, currentPath)
+	fmt.Println("login_id already connected on the server.")
+	fmt.Println("Choose an identity to use:")
+	idx := 1
+	indexToPath := make(map[int]string)
+	for _, c := range candidates {
+		if c.Path == currentPath {
+			continue
+		}
+		fmt.Printf("  %d) switch to %s (%s)\n", idx, shortID(c.LoginID), c.Path)
+		indexToPath[idx] = c.Path
+		idx++
+	}
+	createIdx := idx
+	fmt.Printf("  %d) create a new identity\n", createIdx)
+	fmt.Println("  q) quit")
+	fmt.Print("> ")
+
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	choice := strings.TrimSpace(line)
+	if strings.EqualFold(choice, "q") {
+		return "", fmt.Errorf("aborted by user")
+	}
+	n, err := strconv.Atoi(choice)
+	if err != nil {
+		return "", fmt.Errorf("invalid choice")
+	}
+	if p, ok := indexToPath[n]; ok {
+		return p, nil
+	}
+	if n == createIdx {
+		idsDir := filepath.Join(home, ".goaccord", "identities")
+		if err := os.MkdirAll(idsDir, 0o700); err != nil {
+			return "", err
+		}
+		path := filepath.Join(idsDir, fmt.Sprintf("id-%d.json", time.Now().UnixNano()))
+		if _, err := loadOrCreateKey(path); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("invalid choice")
+}
+
+func connectWithIdentitySelection(addr string, home string, initialKeyPath string) (string, ed25519.PrivateKey, net.Conn, *json.Encoder, <-chan netMsg, string, string, error) {
+	keyPath := initialKeyPath
+	for {
+		priv, err := loadOrCreateKey(keyPath)
+		if err != nil {
+			return "", nil, nil, nil, nil, "", "", fmt.Errorf("key load/create failed: %w", err)
+		}
+		conn, enc, events, loginID, pubB64, err := runAuth(addr, priv)
+		if err == nil {
+			return keyPath, priv, conn, enc, events, loginID, pubB64, nil
+		}
+		if !strings.Contains(err.Error(), "login id already connected") {
+			return "", nil, nil, nil, nil, "", "", err
+		}
+		nextKeyPath, pickErr := promptIdentityPath(home, keyPath)
+		if pickErr != nil {
+			return "", nil, nil, nil, nil, "", "", err
+		}
+		keyPath = nextKeyPath
+	}
+}
 func main() {
 	addr := flag.String("addr", "127.0.0.1:9101", "server address")
 	keyPath := flag.String("key", "", "private key file path")
@@ -678,20 +891,15 @@ func main() {
 		*contactsPath = filepath.Join(home, ".goaccord", "contacts.json")
 	}
 
-	priv, err := loadOrCreateKey(*keyPath)
+	selectedKeyPath, priv, conn, enc, events, loginID, pubB64, err := connectWithIdentitySelection(*addr, home, *keyPath)
 	if err != nil {
-		fmt.Printf("key load/create failed: %v\n", err)
+		fmt.Printf("connect/auth failed: %v\n", err)
 		os.Exit(1)
 	}
+	*keyPath = selectedKeyPath
 	contacts, err := loadContacts(*contactsPath)
 	if err != nil {
 		fmt.Printf("contacts load failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	conn, enc, events, loginID, pubB64, err := runAuth(*addr, priv)
-	if err != nil {
-		fmt.Printf("connect/auth failed: %v\n", err)
 		os.Exit(1)
 	}
 
