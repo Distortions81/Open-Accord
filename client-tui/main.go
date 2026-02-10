@@ -107,15 +107,23 @@ func main() {
 	m.addInfoEntry("contacts file: " + *contactsPath)
 	m.addInfoEntry("profile file: " + *profilePath)
 	m.addInfoEntry("/help for commands")
+	if err := m.publishOwnProfile(); err != nil {
+		m.addInfoEntry("profile publish failed: " + err.Error())
+	}
 
 	if initialTo := strings.TrimSpace(*to); initialTo != "" {
 		if resolved, ok := m.resolveRecipient(initialTo); ok {
 			m.to = resolved
 			m.applyFocus(panelTarget{mode: panelDirect, direct: resolved})
+			m.requestProfile(resolved)
 			m.addInfoEntry("initial recipient: " + m.displayPeer(resolved))
 		} else {
 			m.addInfoEntry("unknown initial recipient: " + initialTo)
 		}
+	}
+
+	for _, id := range m.contacts {
+		m.requestProfile(id)
 	}
 
 	if strings.TrimSpace(*group) != "" && strings.TrimSpace(*channel) != "" {

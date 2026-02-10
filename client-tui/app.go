@@ -225,6 +225,15 @@ func (m *model) requestProfile(target string) {
 	_ = m.sendSigned(Packet{Type: "profile_get", To: target})
 }
 
+func (m *model) publishOwnProfile() error {
+	payload := profilePayload{Nickname: m.displayName, ProfileText: m.profileText}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return m.sendSigned(Packet{Type: "profile_set", Body: string(b)})
+}
+
 func (m *model) applyFocus(t panelTarget) {
 	switch t.mode {
 	case panelAll:
@@ -470,6 +479,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err := m.sendSigned(Packet{Type: "send", To: m.to, Body: line}); err != nil {
 				return m, tea.Batch(logLine("send error: "+err.Error()), tea.Quit)
 			}
+			if m.displayPeer(m.to) == shortID(m.to) {
+				m.requestProfile(m.to)
+			}
 			directCtx = m.to
 			m.addChatEntry(m.displayName, line, directCtx, "")
 			return m, nil
@@ -508,6 +520,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "friend_request", "friend_update", "channel_invite", "channel_update", "channel_joined":
 			if msg.pkt.Type == "friend_request" && msg.pkt.To == m.loginID && looksLikeLoginID(msg.pkt.From) {
 				m.lastFriendRequest = msg.pkt.From
+				m.requestProfile(msg.pkt.From)
 			}
 			if msg.pkt.Type == "friend_update" {
 				other := msg.pkt.From
@@ -992,7 +1005,9 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if err := m.sendSigned(Packet{Type: "friend_add", To: target}); err != nil {
 			return logLine("friend-add error: " + err.Error())
 		}
-		m.requestProfile(target)
+		if m.displayPeer(target) == shortID(target) {
+			m.requestProfile(target)
+		}
 		return logLine("friend request sent to " + m.displayPeer(target))
 	case "/friend-accept":
 		target := ""
@@ -1014,7 +1029,9 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if err := m.sendSigned(Packet{Type: "friend_accept", To: target}); err != nil {
 			return logLine("friend-accept error: " + err.Error())
 		}
-		m.requestProfile(target)
+		if m.displayPeer(target) == shortID(target) {
+			m.requestProfile(target)
+		}
 		if target == m.lastFriendRequest {
 			m.lastFriendRequest = ""
 		}
