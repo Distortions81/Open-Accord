@@ -1181,15 +1181,22 @@ func (s *Server) snapshotPresence(loginID string) presenceData {
 	}
 	s.mu.RLock()
 	st, ok := s.presence[loginID]
+	connected := len(s.users[loginID]) > 0
 	s.mu.RUnlock()
 	now := time.Now().Unix()
 	if !ok {
+		if connected {
+			return presenceData{State: "online", TTLSec: minPresenceTTLSec, UpdatedAt: now, ExpiresAt: now + int64(minPresenceTTLSec)}
+		}
 		return presenceData{State: "offline", TTLSec: minPresenceTTLSec}
 	}
 	if !st.Visible {
 		return presenceData{State: "invisible", TTLSec: st.TTLSec, UpdatedAt: st.UpdatedAt, ExpiresAt: st.ExpiresAt}
 	}
 	if st.ExpiresAt <= now {
+		if connected {
+			return presenceData{State: "online", TTLSec: st.TTLSec, UpdatedAt: st.UpdatedAt, ExpiresAt: now + int64(st.TTLSec)}
+		}
 		return presenceData{State: "offline", TTLSec: st.TTLSec, UpdatedAt: st.UpdatedAt, ExpiresAt: st.ExpiresAt}
 	}
 	return presenceData{State: "online", TTLSec: st.TTLSec, UpdatedAt: st.UpdatedAt, ExpiresAt: st.ExpiresAt}

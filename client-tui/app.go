@@ -73,6 +73,18 @@ type profilePayload struct {
 	ProfileText string `json:"profile_text,omitempty"`
 }
 
+type presenceKeepalivePayload struct {
+	Visible bool `json:"visible"`
+	TTLSec  int  `json:"ttl_sec"`
+}
+
+type presenceDataPayload struct {
+	State     string `json:"state"`
+	TTLSec    int    `json:"ttl_sec"`
+	UpdatedAt int64  `json:"updated_at,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+}
+
 type savedNickname struct {
 	LoginID  string `json:"login_id"`
 	Nickname string `json:"nickname"`
@@ -114,13 +126,19 @@ type panelTarget struct {
 }
 
 const (
-	compressionNone  = "none"
-	compressionZlib  = "zlib"
-	compressMinBytes = 64
-	panelAll         = "all"
-	panelDirect      = "direct"
-	panelChannel     = "channel"
+	compressionNone           = "none"
+	compressionZlib           = "zlib"
+	compressMinBytes          = 64
+	panelAll                  = "all"
+	panelDirect               = "direct"
+	panelChannel              = "channel"
+	presenceKeepaliveInterval = 5 * time.Minute
+	minPresenceTTLSec         = 180
+	maxPresenceTTLSec         = 900
+	defaultPresenceTTLSec     = 390
 )
+
+type presenceTickMsg struct{}
 
 type model struct {
 	input textinput.Model
@@ -147,6 +165,10 @@ type model struct {
 	nicknames         map[string]string
 	peerProfiles      map[string]string
 	lastFriendRequest string
+	presence          map[string]string
+	presenceTTL       map[string]int
+	presenceVisible   bool
+	presenceTTLSec    int
 
 	infoEntries []string
 	chatEntries []uiEntry
@@ -177,8 +199,14 @@ func logLine(s string) tea.Cmd {
 	return func() tea.Msg { return localMsg{line: s} }
 }
 
+func schedulePresenceTick() tea.Cmd {
+	return tea.Tick(presenceKeepaliveInterval, func(time.Time) tea.Msg {
+		return presenceTickMsg{}
+	})
+}
+
 func (m model) Init() tea.Cmd {
-	return tea.Batch(waitNet(m.events), textinput.Blink)
+	return tea.Batch(waitNet(m.events), textinput.Blink, schedulePresenceTick())
 }
 
 func (m *model) addInfoEntry(line string) {
@@ -223,6 +251,51 @@ func (m *model) requestProfile(target string) {
 		return
 	}
 	_ = m.sendSigned(Packet{Type: "profile_get", To: target})
+}
+
+func (m *model) requestPresence(target string) {
+	target = strings.TrimSpace(target)
+	if !looksLikeLoginID(target) || target == m.loginID {
+		return
+	}
+	_ = m.enc.Encode(Packet{Type: "presence_get", To: target})
+}
+
+func normalizePresenceTTLSec(ttl int) int {
+	if ttl < minPresenceTTLSec {
+		return minPresenceTTLSec
+	}
+	if ttl > maxPresenceTTLSec {
+		return maxPresenceTTLSec
+	}
+	return ttl
+}
+
+func (m *model) setPresence(loginID string, state string, ttl int) {
+	loginID = strings.TrimSpace(loginID)
+	state = strings.ToLower(strings.TrimSpace(state))
+	if !looksLikeLoginID(loginID) {
+		return
+	}
+	switch state {
+	case "online", "offline", "invisible":
+	default:
+		state = "unknown"
+	}
+	m.presence[loginID] = state
+	if ttl > 0 {
+		m.presenceTTL[loginID] = normalizePresenceTTLSec(ttl)
+	}
+}
+
+func (m *model) sendPresenceKeepalive() error {
+	ttl := normalizePresenceTTLSec(m.presenceTTLSec)
+	m.presenceTTLSec = ttl
+	b, err := json.Marshal(presenceKeepalivePayload{Visible: m.presenceVisible, TTLSec: ttl})
+	if err != nil {
+		return err
+	}
+	return m.sendSigned(Packet{Type: "presence_keepalive", Body: string(b)})
 }
 
 func (m *model) publishOwnProfile() error {
@@ -275,7 +348,8 @@ func (m *model) commandNames() []string {
 	return []string{
 		"/help", "/to", "/use", "/contacts", "/remove-contact", "/friends",
 		"/dm", "/identities", "/switchid",
-		"/nick", "/myname",
+		"/nick", "/myname", "/profile", "/profile-get",
+		"/presence", "/presence-check",
 		"/chat", "/chat-channel", "/panels", "/focus",
 		"/group", "/channel", "/clearctx", "/whoami",
 		"/friend-add", "/friend-accept",
@@ -360,7 +434,7 @@ func (m *model) handleTab(line string) (string, string) {
 	}
 
 	expectsRecipient := map[string]struct{}{
-		"/to": {}, "/use": {}, "/chat": {}, "/dm": {}, "/friend-add": {}, "/friend-accept": {}, "/invite": {},
+		"/to": {}, "/use": {}, "/chat": {}, "/dm": {}, "/friend-add": {}, "/friend-accept": {}, "/invite": {}, "/presence-check": {},
 	}
 	if _, ok := expectsRecipient[parts[0]]; ok {
 		if len(parts) >= 2 && !strings.HasSuffix(trimmed, " ") {
@@ -486,6 +560,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addChatEntry(m.displayName, line, directCtx, "")
 			return m, nil
 		}
+	case presenceTickMsg:
+		cmds := []tea.Cmd{schedulePresenceTick()}
+		if err := m.sendPresenceKeepalive(); err != nil {
+			cmds = append(cmds, logLine("presence keepalive failed: "+err.Error()))
+		}
+		return m, tea.Batch(cmds...)
 	case netMsg:
 		if msg.err != nil {
 			if msg.err == io.EOF {
@@ -504,6 +584,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.pkt.Type {
 		case "deliver", "channel_deliver":
+			if looksLikeLoginID(msg.pkt.From) {
+				m.setPresence(msg.pkt.From, "online", defaultPresenceTTLSec)
+			}
 			line := msg.pkt.Body
 			if msg.pkt.Origin != "" {
 				m.addInfoEntry("message via " + msg.pkt.Origin)
@@ -517,7 +600,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.addChatEntry(m.displayPeer(msg.pkt.From), line, directCtx, channelCtx)
 			return m, waitNet(m.events)
+		case "ping":
+			if looksLikeLoginID(msg.pkt.From) {
+				m.setPresence(msg.pkt.From, "online", defaultPresenceTTLSec)
+			}
+			replyBody, _ := json.Marshal(map[string]any{"ping_id": msg.pkt.ID})
+			if err := m.sendSigned(Packet{Type: "pong", To: msg.pkt.From, Body: string(replyBody)}); err != nil {
+				m.addInfoEntry("pong send failed: " + err.Error())
+			}
+			return m, waitNet(m.events)
+		case "pong":
+			if looksLikeLoginID(msg.pkt.From) {
+				m.setPresence(msg.pkt.From, "online", defaultPresenceTTLSec)
+			}
+			m.addInfoEntry("pong from " + m.displayPeer(msg.pkt.From))
+			return m, waitNet(m.events)
 		case "friend_request", "friend_update", "channel_invite", "channel_update", "channel_joined":
+			if looksLikeLoginID(msg.pkt.From) {
+				m.setPresence(msg.pkt.From, "online", defaultPresenceTTLSec)
+			}
 			if msg.pkt.Type == "friend_request" && msg.pkt.To == m.loginID && looksLikeLoginID(msg.pkt.From) {
 				m.lastFriendRequest = msg.pkt.From
 				m.requestProfile(msg.pkt.From)
@@ -541,6 +642,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addInfoEntry(line)
 			return m, waitNet(m.events)
 		case "profile_data":
+			if looksLikeLoginID(msg.pkt.From) {
+				m.setPresence(msg.pkt.From, "online", defaultPresenceTTLSec)
+			}
 			decoded, err := decodeTextBodyForClient(msg.pkt)
 			if err != nil {
 				m.addInfoEntry("profile decode failed: " + err.Error())
@@ -569,6 +673,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				line += " bio=" + existing
 			}
 			m.addInfoEntry(line)
+			return m, waitNet(m.events)
+		case "presence_data":
+			var pd presenceDataPayload
+			if err := json.Unmarshal([]byte(strings.TrimSpace(msg.pkt.Body)), &pd); err == nil {
+				m.setPresence(msg.pkt.From, pd.State, pd.TTLSec)
+			} else {
+				m.setPresence(msg.pkt.From, msg.pkt.Body, 0)
+			}
 			return m, waitNet(m.events)
 		case "error":
 			m.addInfoEntry("server error: " + msg.pkt.Body)
@@ -770,7 +882,7 @@ func (m *model) formatFriends() string {
 	lines := make([]string, 0, len(ids)+1)
 	lines = append(lines, "friends:")
 	for _, id := range ids {
-		lines = append(lines, fmt.Sprintf("  %s (%s)", m.displayPeer(id), id))
+		lines = append(lines, fmt.Sprintf("  %s (%s) %s", m.displayPeer(id), id, m.presenceSummary(id)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -804,10 +916,22 @@ func (m *model) formatDMList() string {
 	}
 	lines := []string{"dm targets:"}
 	for i, id := range ids {
-		lines = append(lines, fmt.Sprintf("  %d) %s (%s)", i+1, m.displayPeer(id), id))
+		lines = append(lines, fmt.Sprintf("  %d) %s (%s) %s", i+1, m.displayPeer(id), id, m.presenceSummary(id)))
 	}
 	lines = append(lines, "use /dm <index|name|login_id>")
 	return strings.Join(lines, "\n")
+}
+
+func (m *model) presenceSummary(loginID string) string {
+	state := strings.TrimSpace(m.presence[loginID])
+	if state == "" {
+		state = "unknown"
+	}
+	ttl := m.presenceTTL[loginID]
+	if ttl > 0 {
+		return fmt.Sprintf("status=%s ttl=%ds", state, ttl)
+	}
+	return "status=" + state
 }
 
 func (m *model) formatIdentityHelp() string {
@@ -841,7 +965,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 	}
 	switch parts[0] {
 	case "/help":
-		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /profile /profile-get /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
+		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /profile /profile-get /presence /presence-check /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
 	case "/to", "/use", "/chat", "/dm":
 		if parts[0] == "/dm" && len(parts) < 2 {
 			return logLine(m.formatDMList())
@@ -978,6 +1102,50 @@ func (m *model) handleCommand(line string) tea.Cmd {
 			return logLine("profile-get failed: " + err.Error())
 		}
 		return logLine("profile requested for " + m.displayPeer(target))
+	case "/presence":
+		if len(parts) == 1 {
+			mode := "invisible"
+			if m.presenceVisible {
+				mode = "visible"
+			}
+			return logLine(fmt.Sprintf("presence: %s ttl=%ds (usage: /presence <visible|invisible> [ttl_sec %d-%d])", mode, m.presenceTTLSec, minPresenceTTLSec, maxPresenceTTLSec))
+		}
+		mode := strings.ToLower(strings.TrimSpace(parts[1]))
+		visible := mode == "visible"
+		if mode != "visible" && mode != "invisible" {
+			return logLine("usage: /presence <visible|invisible> [ttl_sec]")
+		}
+		ttl := m.presenceTTLSec
+		if len(parts) >= 3 {
+			v, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+			if err != nil {
+				return logLine("ttl_sec must be a number")
+			}
+			ttl = v
+		}
+		m.presenceVisible = visible
+		m.presenceTTLSec = normalizePresenceTTLSec(ttl)
+		if err := m.sendPresenceKeepalive(); err != nil {
+			return logLine("presence update failed: " + err.Error())
+		}
+		return logLine(fmt.Sprintf("presence updated: %s ttl=%ds", mode, m.presenceTTLSec))
+	case "/presence-check":
+		if len(parts) >= 2 {
+			target, ok := m.resolveRecipient(parts[1])
+			if !ok {
+				return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+			}
+			m.requestPresence(target)
+			return logLine("presence requested for " + m.displayPeer(target))
+		}
+		ids := m.friendTargets()
+		for _, id := range ids {
+			m.requestPresence(id)
+		}
+		if len(ids) == 0 {
+			return logLine("presence requested: no known targets")
+		}
+		return logLine(fmt.Sprintf("presence requested for %d targets", len(ids)))
 	case "/group":
 		if len(parts) < 2 {
 			return logLine("usage: /group <name>")

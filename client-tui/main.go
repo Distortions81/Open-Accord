@@ -78,27 +78,31 @@ func main() {
 	in.Width = 80
 
 	m := model{
-		input:        in,
-		enc:          enc,
-		events:       events,
-		conn:         conn,
-		priv:         priv,
-		pubB64:       pubB64,
-		loginID:      loginID,
-		contactsPath: *contactsPath,
-		contacts:     contacts,
-		friends:      make(map[string]struct{}),
-		profilePath:  *profilePath,
-		keyPath:      *keyPath,
-		displayName:  displayName,
-		profileText:  profileText,
-		nicknames:    nicknames,
-		peerProfiles: peerProfiles,
-		group:        strings.TrimSpace(*group),
-		channel:      strings.TrimSpace(*channel),
-		historyIndex: -1,
-		focusMode:    panelAll,
-		panelChoices: make(map[int]panelTarget),
+		input:           in,
+		enc:             enc,
+		events:          events,
+		conn:            conn,
+		priv:            priv,
+		pubB64:          pubB64,
+		loginID:         loginID,
+		contactsPath:    *contactsPath,
+		contacts:        contacts,
+		friends:         make(map[string]struct{}),
+		profilePath:     *profilePath,
+		keyPath:         *keyPath,
+		displayName:     displayName,
+		profileText:     profileText,
+		nicknames:       nicknames,
+		peerProfiles:    peerProfiles,
+		presence:        make(map[string]string),
+		presenceTTL:     make(map[string]int),
+		presenceVisible: true,
+		presenceTTLSec:  defaultPresenceTTLSec,
+		group:           strings.TrimSpace(*group),
+		channel:         strings.TrimSpace(*channel),
+		historyIndex:    -1,
+		focusMode:       panelAll,
+		panelChoices:    make(map[int]panelTarget),
 	}
 
 	m.addInfoEntry("connected to " + *addr)
@@ -109,6 +113,9 @@ func main() {
 	m.addInfoEntry("/help for commands")
 	if err := m.publishOwnProfile(); err != nil {
 		m.addInfoEntry("profile publish failed: " + err.Error())
+	}
+	if err := m.sendPresenceKeepalive(); err != nil {
+		m.addInfoEntry("presence keepalive failed: " + err.Error())
 	}
 
 	if initialTo := strings.TrimSpace(*to); initialTo != "" {
@@ -124,6 +131,7 @@ func main() {
 
 	for _, id := range m.contacts {
 		m.requestProfile(id)
+		m.requestPresence(id)
 	}
 
 	if strings.TrimSpace(*group) != "" && strings.TrimSpace(*channel) != "" {

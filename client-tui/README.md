@@ -31,6 +31,10 @@ Optional flags:
 - `/whoami`
 - `/friend-add <login_id|alias>`
 - `/friend-accept <login_id|alias>`
+- `/profile <text>`
+- `/profile-get <login_id|alias>`
+- `/presence <visible|invisible> [ttl_sec]`
+- `/presence-check [login_id|alias]`
 - `/channel-create <group> <channel> <public|private>`
 - `/invite <login_id|alias>`
 - `/channel-join <group> <channel>`

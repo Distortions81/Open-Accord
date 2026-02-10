@@ -464,15 +464,27 @@ function renderTargets(targets, pendingFriends) {
     const name = document.createElement('div');
     name.textContent = t.label;
     name.style.fontWeight = '700';
-    name.className = 'linkish';
-    name.title = 'View profile';
-    name.onclick = () => openProfileCard(t.id);
+    name.style.minWidth = '0';
+    name.style.flex = '1';
+    name.style.overflowWrap = 'anywhere';
+    name.style.wordBreak = 'break-word';
     const status = document.createElement('span');
     const ttlLabel = (t.online_ttl_sec && t.online_ttl_sec > 0) ? ` ${t.online_ttl_sec}s` : '';
     status.textContent = `${t.online || 'unknown'}${ttlLabel}`;
     status.className = statusClass(t.online);
     const controls = document.createElement('div');
     controls.className = 'friend-controls';
+    const info = document.createElement('button');
+    info.type = 'button';
+    info.className = 'row-icon-btn';
+    info.title = 'View profile';
+    info.setAttribute('aria-label', 'View profile');
+    info.textContent = 'i';
+    info.onclick = (ev) => {
+      ev.stopPropagation();
+      openProfileCard(t.id);
+    };
+    controls.appendChild(info);
     controls.appendChild(status);
     controls.appendChild(createCopyIDControl(t.id));
     const head = document.createElement('div');
@@ -591,7 +603,8 @@ function renderGroups(groups) {
     return;
   }
   const exists = items.some((g) => (g.name || '') === activeGroup);
-  if (!exists) {
+  // Keep DM context stable: only auto-select a group when no DM target is active.
+  if (!exists && !activeTarget) {
     activeGroup = items[0].name || '';
     activeChannel = 'default';
     changed = true;
