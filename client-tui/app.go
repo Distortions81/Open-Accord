@@ -65,6 +65,7 @@ type profileFile struct {
 	DisplayName   string          `json:"display_name"`
 	ProfileText   string          `json:"profile_text"`
 	PeerNicknames []savedNickname `json:"peer_nicknames"`
+	PeerProfiles  []savedProfile  `json:"peer_profiles"`
 }
 
 type profilePayload struct {
@@ -75,6 +76,11 @@ type profilePayload struct {
 type savedNickname struct {
 	LoginID  string `json:"login_id"`
 	Nickname string `json:"nickname"`
+}
+
+type savedProfile struct {
+	LoginID     string `json:"login_id"`
+	ProfileText string `json:"profile_text"`
 }
 
 type contactsFile struct {
@@ -131,14 +137,16 @@ type model struct {
 	group   string
 	channel string
 
-	contactsPath string
-	contacts     map[string]string
-	friends      map[string]struct{}
-	profilePath  string
-	keyPath      string
-	displayName  string
-	profileText  string
-	nicknames    map[string]string
+	contactsPath      string
+	contacts          map[string]string
+	friends           map[string]struct{}
+	profilePath       string
+	keyPath           string
+	displayName       string
+	profileText       string
+	nicknames         map[string]string
+	peerProfiles      map[string]string
+	lastFriendRequest string
 
 	infoEntries []string
 	chatEntries []uiEntry
@@ -207,6 +215,14 @@ func (m *model) displayPeer(loginID string) string {
 		}
 	}
 	return shortID(loginID)
+}
+
+func (m *model) requestProfile(target string) {
+	target = strings.TrimSpace(target)
+	if !looksLikeLoginID(target) || target == m.loginID {
+		return
+	}
+	_ = m.sendSigned(Packet{Type: "profile_get", To: target})
 }
 
 func (m *model) applyFocus(t panelTarget) {
@@ -490,6 +506,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addChatEntry(m.displayPeer(msg.pkt.From), line, directCtx, channelCtx)
 			return m, waitNet(m.events)
 		case "friend_request", "friend_update", "channel_invite", "channel_update", "channel_joined":
+			if msg.pkt.Type == "friend_request" && msg.pkt.To == m.loginID && looksLikeLoginID(msg.pkt.From) {
+				m.lastFriendRequest = msg.pkt.From
+			}
 			if msg.pkt.Type == "friend_update" {
 				other := msg.pkt.From
 				if other == m.loginID {
@@ -522,14 +541,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			nick := strings.TrimSpace(prof.Nickname)
 			if nick != "" && looksLikeLoginID(msg.pkt.From) {
 				m.nicknames[msg.pkt.From] = nick
-				_ = saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames)
+				_ = saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames, m.peerProfiles)
 			}
 			line := "profile " + m.displayPeer(msg.pkt.From)
 			if nick != "" {
 				line += " nick=" + nick
 			}
-			if strings.TrimSpace(prof.ProfileText) != "" {
-				line += " text=" + strings.TrimSpace(prof.ProfileText)
+			peerText := strings.TrimSpace(prof.ProfileText)
+			if peerText != "" && looksLikeLoginID(msg.pkt.From) {
+				m.peerProfiles[msg.pkt.From] = peerText
+				_ = saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames, m.peerProfiles)
+				line += " bio=" + peerText
+			} else if existing := strings.TrimSpace(m.peerProfiles[msg.pkt.From]); existing != "" {
+				line += " bio=" + existing
 			}
 			m.addInfoEntry(line)
 			return m, waitNet(m.events)
@@ -833,6 +857,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		m.group = ""
 		m.channel = ""
 		m.applyFocus(panelTarget{mode: panelDirect, direct: target})
+		m.requestProfile(target)
 		return logLine("chat target set: " + m.displayPeer(m.to))
 	case "/chat-channel":
 		if len(parts) < 3 {
@@ -912,7 +937,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 			return logLine("profile text is required")
 		}
 		m.profileText = text
-		if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames); err != nil {
+		if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames, m.peerProfiles); err != nil {
 			return logLine("profile update failed: " + err.Error())
 		}
 		payload := profilePayload{Nickname: m.displayName, ProfileText: m.profileText}
@@ -967,17 +992,31 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if err := m.sendSigned(Packet{Type: "friend_add", To: target}); err != nil {
 			return logLine("friend-add error: " + err.Error())
 		}
+		m.requestProfile(target)
 		return logLine("friend request sent to " + m.displayPeer(target))
 	case "/friend-accept":
-		if len(parts) < 2 {
-			return logLine("usage: /friend-accept <login_id|alias>")
+		target := ""
+		ok := false
+		if len(parts) >= 2 {
+			target, ok = m.resolveRecipient(parts[1])
+			if !ok {
+				return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+			}
+		} else if strings.TrimSpace(m.lastFriendRequest) != "" {
+			target = m.lastFriendRequest
+			ok = true
+		} else {
+			return logLine("usage: /friend-accept <login_id|alias> (or no arg to accept latest request)")
 		}
-		target, ok := m.resolveRecipient(parts[1])
 		if !ok {
-			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
+			return logLine("no pending friend request to accept")
 		}
 		if err := m.sendSigned(Packet{Type: "friend_accept", To: target}); err != nil {
 			return logLine("friend-accept error: " + err.Error())
+		}
+		m.requestProfile(target)
+		if target == m.lastFriendRequest {
+			m.lastFriendRequest = ""
 		}
 		return logLine("friend accepted: " + m.displayPeer(target))
 	case "/channel-create":
@@ -1118,7 +1157,7 @@ func (m *model) setNickname(loginID string, nickname string) error {
 	if err := m.ensureContact(loginID); err != nil {
 		return err
 	}
-	if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames); err != nil {
+	if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames, m.peerProfiles); err != nil {
 		return err
 	}
 	payload := profilePayload{Nickname: m.displayName, ProfileText: m.profileText}
@@ -1135,7 +1174,7 @@ func (m *model) setDisplayName(name string) error {
 		return fmt.Errorf("display name required")
 	}
 	m.displayName = name
-	if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames); err != nil {
+	if err := saveProfile(m.profilePath, m.displayName, m.profileText, m.nicknames, m.peerProfiles); err != nil {
 		return err
 	}
 	payload := profilePayload{Nickname: m.displayName, ProfileText: m.profileText}
@@ -1177,7 +1216,19 @@ func (m *model) removeContact(alias string) error {
 		return fmt.Errorf("alias not found")
 	}
 	delete(m.contacts, alias)
-	return saveContacts(m.contactsPath, m.contacts)
+	latest, err := loadContacts(m.contactsPath)
+	if err != nil {
+		return err
+	}
+	delete(latest, alias)
+	for a, id := range m.contacts {
+		latest[a] = id
+	}
+	if err := writeContactsAtomic(m.contactsPath, latest); err != nil {
+		return err
+	}
+	m.contacts = latest
+	return nil
 }
 
 func (m *model) sendSigned(p Packet) error {
@@ -1303,6 +1354,22 @@ func loadContacts(path string) (map[string]string, error) {
 }
 
 func saveContacts(path string, contacts map[string]string) error {
+	// Read-merge-write to reduce cross-session clobbering.
+	merged := make(map[string]string)
+	existing, err := loadContacts(path)
+	if err != nil {
+		return err
+	}
+	for a, id := range existing {
+		merged[a] = id
+	}
+	for a, id := range contacts {
+		merged[a] = id
+	}
+	return writeContactsAtomic(path, merged)
+}
+
+func writeContactsAtomic(path string, contacts map[string]string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -1322,18 +1389,19 @@ func saveContacts(path string, contacts map[string]string) error {
 	return writeFileAtomic(path, payload, 0o600)
 }
 
-func loadProfile(path string) (string, string, map[string]string, error) {
+func loadProfile(path string) (string, string, map[string]string, map[string]string, error) {
 	nicks := make(map[string]string)
+	peers := make(map[string]string)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", "", nicks, nil
+			return "", "", nicks, peers, nil
 		}
-		return "", "", nil, err
+		return "", "", nil, nil, err
 	}
 	var f profileFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		return "", "", nil, err
+		return "", "", nil, nil, err
 	}
 	for _, n := range f.PeerNicknames {
 		id := strings.TrimSpace(n.LoginID)
@@ -1343,10 +1411,49 @@ func loadProfile(path string) (string, string, map[string]string, error) {
 		}
 		nicks[id] = nick
 	}
-	return strings.TrimSpace(f.DisplayName), strings.TrimSpace(f.ProfileText), nicks, nil
+	for _, p := range f.PeerProfiles {
+		id := strings.TrimSpace(p.LoginID)
+		text := strings.TrimSpace(p.ProfileText)
+		if !looksLikeLoginID(id) || text == "" {
+			continue
+		}
+		peers[id] = text
+	}
+	return strings.TrimSpace(f.DisplayName), strings.TrimSpace(f.ProfileText), nicks, peers, nil
 }
 
-func saveProfile(path string, displayName string, profileText string, nicknames map[string]string) error {
+func saveProfile(path string, displayName string, profileText string, nicknames map[string]string, peerProfiles map[string]string) error {
+	// Read-merge-write to reduce cross-session clobbering.
+	existingName, existingText, existingNicks, existingPeers, err := loadProfile(path)
+	if err != nil {
+		return err
+	}
+	mergedNicks := make(map[string]string, len(existingNicks)+len(nicknames))
+	for id, nick := range existingNicks {
+		mergedNicks[id] = nick
+	}
+	for id, nick := range nicknames {
+		mergedNicks[id] = nick
+	}
+	mergedPeers := make(map[string]string, len(existingPeers)+len(peerProfiles))
+	for id, text := range existingPeers {
+		mergedPeers[id] = text
+	}
+	for id, text := range peerProfiles {
+		mergedPeers[id] = text
+	}
+	name := strings.TrimSpace(displayName)
+	if name == "" {
+		name = strings.TrimSpace(existingName)
+	}
+	text := strings.TrimSpace(profileText)
+	if text == "" {
+		text = strings.TrimSpace(existingText)
+	}
+	return writeProfileAtomic(path, name, text, mergedNicks, mergedPeers)
+}
+
+func writeProfileAtomic(path string, displayName string, profileText string, nicknames map[string]string, peerProfiles map[string]string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -1362,6 +1469,19 @@ func saveProfile(path string, displayName string, profileText string, nicknames 
 			continue
 		}
 		f.PeerNicknames = append(f.PeerNicknames, savedNickname{LoginID: id, Nickname: nick})
+	}
+	peerIDs := make([]string, 0, len(peerProfiles))
+	for id := range peerProfiles {
+		peerIDs = append(peerIDs, id)
+	}
+	sort.Strings(peerIDs)
+	f.PeerProfiles = make([]savedProfile, 0, len(peerIDs))
+	for _, id := range peerIDs {
+		text := strings.TrimSpace(peerProfiles[id])
+		if text == "" || !looksLikeLoginID(id) {
+			continue
+		}
+		f.PeerProfiles = append(f.PeerProfiles, savedProfile{LoginID: id, ProfileText: text})
 	}
 	payload, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
