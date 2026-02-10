@@ -1,0 +1,321 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.Title}}</title>
+  <style>
+    :root { --bg:#0f1318; --panel:#1a222b; --text:#e6edf3; --muted:#9aa6b2; --accent:#3ea6ff; }
+    body { margin:0; font-family: ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:var(--bg); color:var(--text); }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 12px; display:grid; grid-template-columns: 320px 1fr; gap:12px; }
+    .panel { background:var(--panel); border:1px solid #2d3742; border-radius:8px; padding:10px; }
+    h3 { margin:0 0 8px; font-size:14px; color:var(--muted); }
+    pre { margin:0; white-space:pre-wrap; word-wrap:break-word; overflow-wrap:anywhere; max-height: 38vh; overflow:auto; }
+    input, textarea, button, select { width:100%; box-sizing:border-box; margin:4px 0; padding:8px; border-radius:6px; border:1px solid #33404d; background:#111820; color:var(--text); }
+    button { background: var(--accent); color:#001018; font-weight:700; cursor:pointer; }
+    .row { display:flex; gap:8px; }
+    .row > * { flex:1; }
+    .small { font-size:12px; color:var(--muted); }
+    .linkish { cursor:pointer; color:#8ecbff; text-decoration:underline; text-decoration-color:transparent; transition:text-decoration-color .15s; }
+    .linkish:hover { text-decoration-color:#8ecbff; }
+    #session { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; }
+    #chatLog { max-height: 60vh; overflow:auto; border:1px solid #2d3742; border-radius:6px; padding:6px; }
+    .chat-row { padding: 2px 0; display:flex; gap:8px; align-items:baseline; }
+    .chat-ts { color:var(--muted); font-size:12px; min-width:56px; }
+    .chat-name { color:#8ecbff; cursor:pointer; font-weight:700; white-space:nowrap; }
+    .chat-text { white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
+    .profile-card { position:fixed; right:20px; top:20px; width:320px; z-index:1000; box-shadow:0 10px 28px rgba(0,0,0,.5); }
+    .profile-card .small { margin-bottom:6px; }
+    .muted { color:var(--muted); }
+    @media (max-width: 900px) {
+      .wrap { grid-template-columns: 1fr; }
+      .profile-card { left:12px; right:12px; top:12px; width:auto; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h3>Session</h3>
+    <div id="session" class="small">loading...</div>
+    <h3 style="margin-top:12px">Friends</h3>
+    <div id="friendList" class="small" style="max-height:36vh; overflow:auto; border:1px solid #2d3742; border-radius:6px; padding:6px;"></div>
+    <input id="friendInput" placeholder="add friend (login_id/alias/nickname)">
+    <div class="row">
+      <button id="friendAdd">Friend Add</button>
+      <button id="friendAccept">Friend Accept</button>
+    </div>
+
+    <details style="margin-top:10px;">
+      <summary>Targets</summary>
+      <select id="targetSelect"></select>
+      <input id="targetInput" placeholder="target login_id / alias / nickname">
+      <div class="row">
+        <button id="refreshTargets">Refresh</button>
+        <button id="getProfile">Get Profile</button>
+      </div>
+    </details>
+
+    <details style="margin-top:10px;">
+      <summary>Profile</summary>
+      <input id="displayName" placeholder="display name">
+      <textarea id="profileText" rows="3" placeholder="profile text"></textarea>
+      <button id="saveProfile">Save Profile</button>
+    </details>
+
+    <div class="small" style="margin-top:8px">This UI polls local events from the client process.</div>
+  </div>
+
+  <div>
+    <div class="panel" style="margin-bottom:12px;">
+      <h3>Info</h3>
+      <pre id="info"></pre>
+    </div>
+    <div class="panel">
+      <h3>Chat</h3>
+      <div id="chatLog"></div>
+      <textarea id="message" rows="4" placeholder="type message"></textarea>
+      <button id="send">Send DM</button>
+    </div>
+  </div>
+</div>
+
+<div id="profileCard" class="panel profile-card" hidden>
+  <div class="row" style="align-items:center;">
+    <h3 style="margin:0; flex:1;">Profile</h3>
+    <button id="profileClose" style="width:auto; padding:4px 8px;">X</button>
+  </div>
+  <div class="small muted">Nickname</div>
+  <div id="cardNickname"></div>
+  <div class="small muted" style="margin-top:8px;">Login ID</div>
+  <div id="cardID" style="white-space:pre-wrap; overflow-wrap:anywhere;"></div>
+  <div class="small muted" style="margin-top:8px;">Profile text</div>
+  <div id="cardProfile" style="white-space:pre-wrap; overflow-wrap:anywhere;"></div>
+  <div class="small muted" style="margin-top:8px;">Last refreshed</div>
+  <div id="cardRefreshed"></div>
+</div>
+
+<script>
+let since = 0;
+const infoEl = document.getElementById('info');
+const chatEl = document.getElementById('chatLog');
+const targetSelect = document.getElementById('targetSelect');
+const targetInput = document.getElementById('targetInput');
+const friendList = document.getElementById('friendList');
+const profileCard = document.getElementById('profileCard');
+const cardNickname = document.getElementById('cardNickname');
+const cardID = document.getElementById('cardID');
+const cardProfile = document.getElementById('cardProfile');
+const cardRefreshed = document.getElementById('cardRefreshed');
+document.getElementById('profileClose').onclick = () => { profileCard.hidden = true; };
+
+function appendInfo(line) {
+  infoEl.textContent += line + "\n";
+  const lines = infoEl.textContent.split("\n");
+  if (lines.length > 500) infoEl.textContent = lines.slice(lines.length - 500).join("\n");
+  infoEl.scrollTop = infoEl.scrollHeight;
+}
+
+function appendChat(ev) {
+  const row = document.createElement('div');
+  row.className = 'chat-row';
+  const ts = document.createElement('span');
+  ts.className = 'chat-ts';
+  ts.textContent = ev.ts || '';
+  const name = document.createElement('span');
+  name.className = 'chat-name';
+  name.textContent = ev.actor_label || 'unknown';
+  if (ev.actor_id) {
+    name.title = 'View profile';
+    name.onclick = () => openProfileCard(ev.actor_id);
+  } else {
+    name.className = '';
+  }
+  const msg = document.createElement('span');
+  msg.className = 'chat-text';
+  msg.textContent = ev.text || '';
+  row.appendChild(ts);
+  row.appendChild(name);
+  row.appendChild(msg);
+  chatEl.appendChild(row);
+  while (chatEl.childElementCount > 500) {
+    chatEl.removeChild(chatEl.firstChild);
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function currentTarget() {
+  const manual = targetInput.value.trim();
+  if (manual) return manual;
+  return targetSelect.value || '';
+}
+
+async function post(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {})
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ('http ' + res.status));
+  return data;
+}
+
+function relativeTime(unixSec) {
+  if (!unixSec || unixSec <= 0) return 'unknown';
+  const delta = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+  if (delta < 10) return 'just now';
+  if (delta < 60) return `${delta}s ago`;
+  const minutes = Math.floor(delta / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+async function openProfileCard(loginID) {
+  if (!loginID) return;
+  try {
+    const res = await fetch('/api/profile/card?id=' + encodeURIComponent(loginID));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || ('http ' + res.status));
+    const p = data.profile || {};
+    cardNickname.textContent = p.nickname || p.label || '(unknown)';
+    cardID.textContent = p.id || loginID;
+    cardProfile.textContent = p.profile_text || '(empty)';
+    cardRefreshed.textContent = relativeTime(p.last_refreshed || 0);
+    profileCard.hidden = false;
+  } catch (e) {
+    appendInfo(`profile card failed: ${e.message}`);
+  }
+}
+
+function renderTargets(targets) {
+  const prev = targetSelect.value;
+  targetSelect.innerHTML = '';
+  friendList.innerHTML = '';
+  for (const t of targets || []) {
+    const o = document.createElement('option');
+    o.value = t.id;
+    o.textContent = `${t.label} (${t.id.slice(0,12)})`;
+    targetSelect.appendChild(o);
+
+    const row = document.createElement('div');
+    row.style.padding = '6px 4px';
+    row.style.borderBottom = '1px solid #25303b';
+    row.style.wordBreak = 'break-all';
+    row.style.overflowWrap = 'anywhere';
+
+    const name = document.createElement('div');
+    name.textContent = t.label;
+    name.style.fontWeight = '700';
+    name.className = 'linkish';
+    name.title = 'View profile';
+    name.onclick = () => openProfileCard(t.id);
+
+    const id = document.createElement('div');
+    id.textContent = t.id;
+    id.className = 'linkish';
+    id.title = 'Click to select this user id';
+    id.onclick = () => {
+      targetInput.value = t.id;
+      targetInput.focus();
+      targetInput.select();
+    };
+
+    row.appendChild(name);
+    row.appendChild(id);
+    friendList.appendChild(row);
+  }
+  if ((targets || []).length === 0) {
+    friendList.textContent = 'No friends/targets yet';
+  }
+  if (prev) targetSelect.value = prev;
+}
+
+async function bootstrap() {
+  const res = await fetch('/api/bootstrap');
+  const data = await res.json();
+  const session = document.getElementById('session');
+  session.innerHTML = '';
+  const n = document.createElement('div');
+  n.textContent = data.display_name || '(no nickname)';
+  n.style.fontWeight = '700';
+  const id = document.createElement('div');
+  id.textContent = data.login_id || '';
+  id.className = 'linkish';
+  id.title = 'Click to select your login id';
+  id.onclick = () => {
+    targetInput.value = data.login_id || '';
+    targetInput.focus();
+    targetInput.select();
+  };
+  session.appendChild(n);
+  session.appendChild(id);
+  document.getElementById('displayName').value = data.display_name || '';
+  document.getElementById('profileText').value = data.profile_text || '';
+  renderTargets(data.targets || []);
+}
+
+async function poll() {
+  try {
+    const res = await fetch('/api/events?since=' + since);
+    const data = await res.json();
+    for (const ev of (data.events || [])) {
+      since = Math.max(since, ev.seq || 0);
+      if (ev.kind === 'chat') appendChat(ev);
+      else appendInfo(`${ev.ts} ${ev.text}`);
+    }
+    if (data.targets) renderTargets(data.targets);
+  } catch (e) {
+    appendInfo(`poll error: ${e.message}`);
+  }
+}
+
+setInterval(poll, 1000);
+bootstrap().then(poll);
+
+document.getElementById('send').onclick = async () => {
+  const to = currentTarget();
+  const text = document.getElementById('message').value.trim();
+  if (!to || !text) return;
+  try {
+    await post('/api/send', {to, text});
+    document.getElementById('message').value = '';
+  } catch (e) { appendInfo(`send failed: ${e.message}`); }
+};
+
+document.getElementById('friendAdd').onclick = async () => {
+  const to = document.getElementById('friendInput').value.trim() || currentTarget();
+  if (!to) return;
+  try { await post('/api/friend/add', {to}); } catch (e) { appendInfo(`friend-add failed: ${e.message}`); }
+};
+
+document.getElementById('friendAccept').onclick = async () => {
+  const to = document.getElementById('friendInput').value.trim();
+  try { await post('/api/friend/accept', to ? {to} : {}); } catch (e) { appendInfo(`friend-accept failed: ${e.message}`); }
+};
+
+document.getElementById('saveProfile').onclick = async () => {
+  const display_name = document.getElementById('displayName').value.trim();
+  const profile_text = document.getElementById('profileText').value.trim();
+  try { await post('/api/profile/set', {display_name, profile_text}); } catch (e) { appendInfo(`profile save failed: ${e.message}`); }
+};
+
+document.getElementById('getProfile').onclick = async () => {
+  const to = currentTarget();
+  if (!to) return;
+  try { await post('/api/profile/get', {to}); } catch (e) { appendInfo(`profile-get failed: ${e.message}`); }
+};
+
+document.getElementById('refreshTargets').onclick = async () => {
+  try {
+    const res = await fetch('/api/targets');
+    const data = await res.json();
+    renderTargets(data.targets || []);
+  } catch (e) { appendInfo(`refresh failed: ${e.message}`); }
+};
+</script>
+</body>
+</html>
