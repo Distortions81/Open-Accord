@@ -29,6 +29,11 @@ type testServerConfig struct {
 	maxSeenEntries  int
 	maxKnownAddrs   int
 	knownAddrTTL    time.Duration
+	persistenceMode string
+	persistenceDB   string
+	persistAutoHost bool
+	maxPendingMsgs  int
+	preHostedUsers  []string
 }
 
 func defaultTestServerConfig() testServerConfig {
@@ -39,6 +44,9 @@ func defaultTestServerConfig() testServerConfig {
 		maxSeenEntries:  defaultMaxSeenEntries,
 		maxKnownAddrs:   defaultMaxKnownAddrs,
 		knownAddrTTL:    defaultKnownAddrTTL,
+		persistenceMode: persistenceModeLive,
+		persistAutoHost: true,
+		maxPendingMsgs:  500,
 	}
 }
 
@@ -77,6 +85,21 @@ func startTestServer(t *testing.T, localSID, advertise string, seedAddrs []strin
 		cfg.maxKnownAddrs,
 		cfg.knownAddrTTL,
 	)
+	s.persistenceMode = cfg.persistenceMode
+	s.persistAutoHost = cfg.persistAutoHost
+	s.maxPendingMsgs = cfg.maxPendingMsgs
+	if s.persistenceMode == persistenceModePersist {
+		store, err := openSQLiteStore(cfg.persistenceDB, s.id, ownerLoginID, s.maxPendingMsgs)
+		if err != nil {
+			t.Fatalf("openSQLiteStore failed: %v", err)
+		}
+		s.store = store
+		for _, u := range cfg.preHostedUsers {
+			if err := s.store.addHostedUser(u); err != nil {
+				t.Fatalf("pre-host user failed: %v", err)
+			}
+		}
+	}
 	for _, seed := range seedAddrs {
 		s.addKnownAddr(seed)
 	}
@@ -106,6 +129,11 @@ func startTestServer(t *testing.T, localSID, advertise string, seedAddrs []strin
 		case <-time.After(2 * time.Second):
 			t.Fatalf("server did not stop")
 		}
+		if s.store != nil {
+			if err := s.store.Close(); err != nil {
+				t.Fatalf("store close failed: %v", err)
+			}
+		}
 	}
 
 	return ln.Addr().String(), s, stop
@@ -113,11 +141,16 @@ func startTestServer(t *testing.T, localSID, advertise string, seedAddrs []strin
 
 func newTestClient(t *testing.T, addr string) *testClient {
 	t.Helper()
-
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("key generation failed: %v", err)
 	}
+	return newTestClientWithKey(t, addr, priv)
+}
+
+func newTestClientWithKey(t *testing.T, addr string, priv ed25519.PrivateKey) *testClient {
+	t.Helper()
+	pub := priv.Public().(ed25519.PublicKey)
 	pubB64 := base64.StdEncoding.EncodeToString(pub)
 
 	conn, err := net.Dial("tcp", addr)
@@ -437,5 +470,81 @@ func TestNonRelayPeerDoesNotReceiveRelayedTraffic(t *testing.T) {
 	alice.send(t, bobNoRelay.loginID, "to non-relay peer")
 	if p, err := bobNoRelay.recvMaybe(500 * time.Millisecond); err == nil {
 		t.Fatalf("non-relay peer should not receive relayed traffic, got %+v", p)
+	}
+}
+
+func TestPersistModeQueuesAndReplaysOfflineMessages(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	cfg.persistenceMode = persistenceModePersist
+	cfg.persistAutoHost = true
+	tempDir := t.TempDir()
+	cfg.persistenceDB = tempDir + "/state.sqlite"
+
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	alice := newTestClient(t, addr)
+	defer alice.close()
+
+	_, bobPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("bob key generation failed: %v", err)
+	}
+	bob1 := newTestClientWithKey(t, addr, bobPriv)
+	bobID := bob1.loginID
+	bob1.close()
+
+	alice.send(t, bobID, "queued-1")
+	time.Sleep(150 * time.Millisecond)
+
+	bob2 := newTestClientWithKey(t, addr, bobPriv)
+	defer bob2.close()
+
+	msg := bob2.recv(t, 2*time.Second)
+	if msg.Type != "deliver" {
+		t.Fatalf("expected deliver, got %+v", msg)
+	}
+	if msg.Body != "queued-1" || msg.To != bobID {
+		t.Fatalf("unexpected replay payload: %+v", msg)
+	}
+}
+
+func TestPersistModeCanRequirePreHostedUsers(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	cfg.persistenceMode = persistenceModePersist
+	cfg.persistAutoHost = false
+	tempDir := t.TempDir()
+	cfg.persistenceDB = tempDir + "/state.sqlite"
+
+	_, blockedPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("blocked key generation failed: %v", err)
+	}
+	allowedPub, allowedPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("allowed key generation failed: %v", err)
+	}
+	cfg.preHostedUsers = []string{loginIDForPubKey(allowedPub)}
+
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	allowedResp, err := loginWithKey(t, addr, allowedPriv)
+	if err != nil {
+		t.Fatalf("allowed login flow failed: %v", err)
+	}
+	if allowedResp.Type != "ok" {
+		t.Fatalf("allowed user expected ok, got %+v", allowedResp)
+	}
+
+	blockedResp, err := loginWithKey(t, addr, blockedPriv)
+	if err != nil {
+		t.Fatalf("blocked login flow failed: %v", err)
+	}
+	if blockedResp.Type != "error" {
+		t.Fatalf("blocked user expected error, got %+v", blockedResp)
+	}
+	if !strings.Contains(blockedResp.Body, "client access not allowed") {
+		t.Fatalf("unexpected blocked response: %+v", blockedResp)
 	}
 }

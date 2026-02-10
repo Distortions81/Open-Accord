@@ -33,6 +33,8 @@ const (
 	clientModeDisabled     = "disabled"
 	clientModePublic       = "public"
 	clientModePrivate      = "private"
+	persistenceModeLive    = "live"
+	persistenceModePersist = "persist"
 )
 
 type Packet struct {
@@ -42,6 +44,8 @@ type Packet struct {
 	From          string   `json:"from,omitempty"`
 	To            string   `json:"to,omitempty"`
 	Body          string   `json:"body,omitempty"`
+	Group         string   `json:"group,omitempty"`
+	Channel       string   `json:"channel,omitempty"`
 	Origin        string   `json:"origin,omitempty"`
 	Nonce         string   `json:"nonce,omitempty"`
 	PubKey        string   `json:"pub_key,omitempty"`
@@ -137,6 +141,10 @@ type Server struct {
 	relayEnabled    bool
 	clientMode      string
 	clientAllow     map[string]struct{}
+	persistenceMode string
+	persistAutoHost bool
+	maxPendingMsgs  int
+	store           *sqliteStore
 
 	mu           sync.RWMutex
 	users        map[string]*Conn
@@ -187,6 +195,9 @@ func NewServer(id, ownerPubKeyB64 string, ownerPriv ed25519.PrivateKey, advertis
 		relayEnabled:    true,
 		clientMode:      clientModePublic,
 		clientAllow:     make(map[string]struct{}),
+		persistenceMode: persistenceModeLive,
+		persistAutoHost: true,
+		maxPendingMsgs:  500,
 		users:           make(map[string]*Conn),
 		peers:           make(map[string]*Peer),
 		seen:            make(map[string]time.Time),
@@ -297,13 +308,36 @@ func (s *Server) isClientAllowed(loginID string) bool {
 	if s.clientMode == clientModeDisabled {
 		return false
 	}
-	if s.clientMode == clientModePublic {
+	if s.clientMode == clientModePrivate {
+		s.mu.RLock()
+		_, ok := s.clientAllow[loginID]
+		s.mu.RUnlock()
+		if !ok {
+			return false
+		}
+	}
+	if s.persistenceMode != persistenceModePersist {
 		return true
 	}
-	s.mu.RLock()
-	_, ok := s.clientAllow[loginID]
-	s.mu.RUnlock()
-	return ok
+	if s.store == nil {
+		return false
+	}
+	hosted, err := s.store.isHostedUser(loginID)
+	if err != nil {
+		log.Printf("hosted user lookup failed for %s: %v", loginID, err)
+		return false
+	}
+	if hosted {
+		return true
+	}
+	if s.persistAutoHost {
+		if err := s.store.addHostedUser(loginID); err != nil {
+			log.Printf("failed to auto-host user %s: %v", loginID, err)
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 func (s *Server) nextMessageID() string {
@@ -710,6 +744,77 @@ func (s *Server) sendToUser(to string, p Packet) bool {
 	return true
 }
 
+func (s *Server) maybeRememberTopology(p Packet) {
+	if s.persistenceMode != persistenceModePersist || s.store == nil {
+		return
+	}
+	if strings.TrimSpace(p.Group) != "" {
+		if err := s.store.rememberGroup(p.Group, p.From); err != nil {
+			log.Printf("persist group metadata failed: %v", err)
+		}
+	}
+	if strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != "" {
+		if err := s.store.rememberChannel(p.Group, p.Channel, p.From); err != nil {
+			log.Printf("persist channel metadata failed: %v", err)
+		}
+	}
+}
+
+func (s *Server) maybeQueueForHostedUser(p Packet) {
+	if s.persistenceMode != persistenceModePersist || s.store == nil {
+		return
+	}
+	if strings.TrimSpace(p.To) == "" {
+		return
+	}
+	if err := s.store.queueMessageForUser(p.To, storedMessage{
+		ID:      p.ID,
+		From:    p.From,
+		To:      p.To,
+		Body:    p.Body,
+		Group:   p.Group,
+		Channel: p.Channel,
+		Origin:  s.id,
+		PubKey:  p.PubKey,
+		Sig:     p.Sig,
+	}); err != nil {
+		log.Printf("persist queue failed for user %s: %v", p.To, err)
+	}
+}
+
+func (s *Server) deliverPending(loginID string) {
+	if s.persistenceMode != persistenceModePersist || s.store == nil {
+		return
+	}
+	for {
+		pending, err := s.store.popPendingForUser(loginID, 200)
+		if err != nil {
+			log.Printf("load pending for %s failed: %v", loginID, err)
+			return
+		}
+		if len(pending) == 0 {
+			return
+		}
+		for _, m := range pending {
+			s.sendToUser(loginID, Packet{
+				Type:    "deliver",
+				ID:      m.ID,
+				From:    m.From,
+				To:      m.To,
+				Body:    m.Body,
+				Group:   m.Group,
+				Channel: m.Channel,
+				Origin:  m.Origin,
+				PubKey:  m.PubKey,
+				Sig:     m.Sig,
+			})
+		}
+		if len(pending) < 200 {
+			return
+		}
+	}
+}
+
 func (s *Server) floodToPeers(exceptID string, p Packet) {
 	raw, _ := json.Marshal(p)
 	type target struct {
@@ -800,6 +905,7 @@ func (s *Server) handleUser(loginID string, c *Conn, reader *bufio.Reader, rl *r
 
 	_ = c.Send(Packet{Type: "ok", ID: loginID, Body: "authenticated"})
 	log.Printf("user connected: %s", loginID)
+	s.deliverPending(loginID)
 
 	for {
 		var p Packet
@@ -830,7 +936,11 @@ func (s *Server) handleUserPacket(sender string, p Packet) {
 		return
 	}
 
-	s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+	s.maybeRememberTopology(p)
+	delivered := s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+	if !delivered {
+		s.maybeQueueForHostedUser(p)
+	}
 	if s.relayEnabled {
 		s.floodToPeers("", p)
 	}
@@ -850,6 +960,14 @@ func (s *Server) handlePeer(peerID, peerAddr string, c *Conn, reader *bufio.Read
 
 	if peerAddr != "" {
 		s.addKnownAddr(peerAddr)
+	}
+	if s.persistenceMode == persistenceModePersist && s.store != nil {
+		owner, _, ok := parseServerID(peerID)
+		if ok {
+			if err := s.store.touchServer(peerID, owner); err != nil {
+				log.Printf("persist peer server metadata failed: %v", err)
+			}
+		}
 	}
 	log.Printf("peer connected: %s (%s)", peerID, peerAddr)
 
@@ -888,7 +1006,11 @@ func (s *Server) handlePeerPacket(fromPeer, peerAddr string, c *Conn, p Packet) 
 		if !s.markSeen(p.ID) {
 			return true
 		}
-		s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+		s.maybeRememberTopology(p)
+		delivered := s.sendToUser(p.To, Packet{Type: "deliver", ID: p.ID, From: p.From, To: p.To, Body: p.Body, Group: p.Group, Channel: p.Channel, Origin: s.id, PubKey: p.PubKey, Sig: p.Sig})
+		if !delivered {
+			s.maybeQueueForHostedUser(p)
+		}
 		if s.relayEnabled {
 			s.floodToPeers(fromPeer, p)
 		}
@@ -1048,6 +1170,10 @@ func main() {
 	relayEnabled := flag.Bool("relay", true, "relay messages across peer network")
 	clientMode := flag.String("client-mode", clientModePublic, "client access mode: public|private|disabled")
 	clientAllowCSV := flag.String("client-allow", "", "comma-separated login_id allowlist for client-mode=private")
+	persistenceMode := flag.String("persistence-mode", persistenceModeLive, "storage mode: live|persist")
+	persistenceDB := flag.String("persistence-db", "", "sqlite database path (used when persistence-mode=persist)")
+	persistAutoHost := flag.Bool("persist-auto-host", true, "auto-register authenticated users as hosted users in persist mode")
+	maxPendingMsgs := flag.Int("max-pending-msgs", 500, "maximum queued offline messages per hosted user in persist mode")
 	flag.Parse()
 
 	if strings.TrimSpace(*ownerKeyPath) == "" {
@@ -1106,6 +1232,39 @@ func main() {
 		if len(s.clientAllow) == 0 {
 			log.Fatalf("client-mode=private requires -client-allow")
 		}
+	}
+
+	s.persistAutoHost = *persistAutoHost
+	s.maxPendingMsgs = *maxPendingMsgs
+	pmode := strings.ToLower(strings.TrimSpace(*persistenceMode))
+	switch pmode {
+	case persistenceModeLive, persistenceModePersist:
+		s.persistenceMode = pmode
+	default:
+		log.Fatalf("invalid -persistence-mode: %s", *persistenceMode)
+	}
+	if s.persistenceMode == persistenceModePersist {
+		dbPath := strings.TrimSpace(*persistenceDB)
+		if dbPath == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				log.Fatalf("unable to resolve home directory: %v", err)
+			}
+			dbPath = filepath.Join(home, ".goaccord", "state", strings.ReplaceAll(s.id, ":", "_")+".sqlite")
+		}
+		store, err := openSQLiteStore(dbPath, s.id, ownerLoginID, s.maxPendingMsgs)
+		if err != nil {
+			log.Fatalf("sqlite init failed: %v", err)
+		}
+		s.store = store
+		defer func() {
+			if err := store.Close(); err != nil {
+				log.Printf("sqlite close error: %v", err)
+			}
+		}()
+		log.Printf("persistence: mode=%s db=%s max-pending-msgs=%d auto-host=%t", s.persistenceMode, dbPath, s.maxPendingMsgs, s.persistAutoHost)
+	} else {
+		log.Printf("persistence: mode=%s", s.persistenceMode)
 	}
 	go s.cleanupSeen(10 * time.Minute)
 	go s.peerManager()

@@ -3,8 +3,10 @@
 ## Status
 This note defines the current architecture target and phased plan.
 
+Protocol reference: `PROTOCOL.md` is the wire-level implementation target for independent clients/servers.
+
 Date: 2026-02-10
-Phase: Live-only messaging network (no persistence yet)
+Phase: Live-only mesh by default, with optional persistence mode.
 
 ## Goals
 - Support user-to-user messaging across a network of servers.
@@ -13,8 +15,7 @@ Phase: Live-only messaging network (no persistence yet)
 - Store as little as possible on servers.
 
 ## Non-goals (Current Phase)
-- No guaranteed offline delivery.
-- No durable message history.
+- No guaranteed global offline delivery guarantees.
 - No central username registry.
 
 ## Identity Model
@@ -32,32 +33,45 @@ Phase: Live-only messaging network (no persistence yet)
 
 ## Trust and Authentication
 - User login uses challenge-response signature verification.
-- User-sent messages are signed end-to-end (at transport protocol level).
+- User-sent messages are signed end-to-end at transport protocol level.
 - Peer servers prove owner binding for `server_id` with owner-key signatures during handshake.
 
-## Storage Policy (Current Phase)
-- Live-only network behavior.
-- Server state is memory-only:
+## Storage Policy
+- Default mode is live-only behavior.
+- Live-only server state is memory-only:
   - active client sessions
   - active peer sessions
   - short-lived message dedupe cache (TTL)
-  - group/channel membership maps
-- No durable user account storage.
-- No durable message storage.
+  - rate-limit/ban cache
+- No durable user account storage in live mode.
+- No durable message storage in live mode.
+
+## Persistence Mode (Opt-In)
+- `persistence-mode=persist` enables local SQLite-backed durable state.
+- Hosted identities:
+  - users can be attached to a persistence server identity
+  - server can auto-host authenticated users or require pre-hosting policy
+- Offline delivery:
+  - messages for hosted-but-offline users are queued
+  - queue is replayed at next successful login
+- Durable metadata (minimal scope):
+  - groups/channels observed in traffic
+  - server identities seen in peer sessions
+- Persistence remains local policy only, not a global authority.
 
 ## Routing Model
 - Servers relay messages across peers.
 - Message IDs are deduped to prevent loops.
 - Delivery is best-effort to currently connected recipients.
+- In persistence mode, hosted offline recipients can receive store-and-forward replay.
 
-## Group and Channel Model (Current Phase)
-- Groups are user-created, with creator identity recorded in memory.
+## Group and Channel Model (Current)
+- Groups are user-created.
 - Channels exist inside groups.
-- Membership and channel metadata are memory-only.
-- Channel messages fan out to currently connected group members.
-- On server restart, group/channel state is lost and must be recreated/rejoined.
+- Current transport supports `group` and `channel` message labels.
+- Full group/channel authorization and role policy are later work.
 
-## Protocol Shape (Current Phase)
+## Protocol Shape (Current)
 - Auth flow:
   - `hello(role=user,pub_key)`
   - `challenge(nonce)`
@@ -66,21 +80,22 @@ Phase: Live-only messaging network (no persistence yet)
 - Direct message flow:
   - `send(id,from,to,body,pub_key,sig)`
   - `deliver(id,from,to,body,...)`
-- Planned group/channel operations:
+- Group/channel labels:
+  - `send(...,group,channel,...)`
+- Planned explicit group/channel operations:
   - `group_create`
   - `group_join`
   - `channel_create`
   - `channel_send`
   - `channel_deliver`
 
-## Operational Limits (Planned)
-- Add a configurable server memory ceiling.
-  - Example future flags: `--max-memory-mb`, `--cache-evict-policy`.
-- Add a configurable ingress rate limit.
-  - Example future flags: `--max-msgs-per-sec`, `--burst`.
-- Add a hard maximum message size and drop anything larger.
+## Operational Limits
+- Keep a configurable server memory ceiling.
+  - Future flags: `--max-memory-mb`, `--cache-evict-policy`.
+- Keep configurable ingress rate limits.
+  - Existing examples: `--max-msgs-per-sec`, `--burst`.
+- Keep a hard maximum packet size and ignore anything larger.
   - Recommended default: `16 KiB` serialized packet size.
-  - Behavior: if packet size exceeds max, server ignores/drops it.
 
 ## Capabilities (Current)
 - Peers advertise capability flags during handshake (`caps`).
@@ -90,31 +105,23 @@ Phase: Live-only messaging network (no persistence yet)
   - `client_public` (accepts any client logins)
   - `client_private` (accepts only allowlisted clients)
   - `client_disabled` (rejects all client logins)
-- Servers reject client logins when `client_disabled` is set.
 
-## Peer Policy and Abuse Handling (Current)
+## Peer Policy and Abuse Handling
 - Peers advertise inbound policy during handshake:
   - `max_msg_bytes`
   - `max_msgs_per_sec`
   - `burst`
 - Each node enforces its own inbound policy.
-- Nodes use peer-advertised max message size to avoid forwarding packets that exceed a peer's declared limit.
+- Nodes use peer-advertised max message size to avoid forwarding oversized packets.
 - Nodes maintain local peer scores and temporary bans for abusive peers.
-  - Invalid/malformed peer traffic increases score.
-  - At threshold, peer is temporarily banned.
-  - Bans are local cache state (memory only), not globally authoritative.
 
 ## Terminology (Network-Native)
-- Avoid block-chain terms in protocol and code naming.
+- Use network messaging terms, not block-chain terms.
 - Preferred vocabulary:
-  - `relay` (not `block-relay`)
-  - `message` / `event` (not `tx`)
-  - `mesh` / `peer transport` (not `block network`)
-  - `sync` / `catch-up` (not `chain sync`)
-- If we later add outbound peer slot classes, keep names network-specific, for example:
-  - `mesh_relay`
-  - `mesh_probe`
-  - `addr_probe`
+  - `relay`
+  - `message` / `event`
+  - `mesh` / `peer transport`
+  - `sync` / `catch-up`
 
 ## Glossary
 - `login_id`
@@ -123,83 +130,43 @@ Function: primary user address and auth identity across the mesh.
 - `server_id`
 Meaning: owner-scoped server identity (`owner_login_id:local_server_id`).
 Function: peer identity namespace without central allocation.
-- `owner_login_id`
-Meaning: login identity derived from the server owner's key.
-Function: cryptographic root used to prove control of `server_id`.
+- `hosted identity`
+Meaning: user identity attached to a persistence server.
+Function: enables optional offline queueing and replay policy.
 - `mesh`
 Meaning: the connected peer-to-peer transport graph.
 Function: path for relaying signed events between servers.
-- `peer`
-Meaning: another server connected over transport.
-Function: exchanges relay traffic, peer addresses, capabilities, and limits.
-- `seed peer`
-Meaning: bootstrap peer configured manually.
-Function: initial entry point into the mesh and address discovery.
-- `known address`
-Meaning: cached peer network endpoint (`host:port`).
-Function: candidate set for future outbound peer connections.
 - `caps`
 Meaning: advertised capability flags in handshake.
 Function: feature negotiation and behavioral gating.
-- `transport` capability
-Meaning: node participates in mesh connectivity.
-Function: allows address exchange and peer session operation.
-- `relay` capability
-Meaning: node relays signed message traffic to peers.
-Function: controls whether node participates in event propagation.
-- `client_mode`
-Meaning: server policy for direct client access (`public|private|disabled`).
-Function: gates which clients may authenticate to the server.
-- `client_allow`
-Meaning: allowlist of `login_id` values (private mode only).
-Function: restricts client entry to approved identities.
-- `max_msg_bytes`
-Meaning: max accepted serialized packet size.
-Function: defensive limit; oversized packets are dropped.
-- `max_msgs_per_sec`
-Meaning: ingress packet rate limit per connection.
-Function: bounds abuse and accidental overload.
-- `burst`
-Meaning: short-term packet allowance above steady rate.
-Function: allows brief spikes without immediate throttling.
 - `seen` cache
 Meaning: bounded cache of recently observed message IDs.
 Function: dedupe and loop prevention in relay paths.
-- `peer score`
-Meaning: local misbehavior score for a peer address.
-Function: drives temporary bans for malformed or invalid traffic.
-- `peer ban`
-Meaning: temporary local deny interval for a peer.
-Function: protects local node without global trust assumptions.
 
 ## Security Notes
 - Collision risk for login IDs is treated as cryptographically negligible.
 - Private keys never leave clients.
 - A compromised server can drop/delay traffic; signatures prevent sender impersonation.
-- For confidentiality against servers, add end-to-end encryption in a later phase.
-
-## Deferred Phase: Optional Persistence
-Persistence is intentionally deferred.
-
-Later, users may run personal persistence servers with opt-in behavior:
-- server mode: `persist`
-- store-and-forward for identities/groups hosted by that server
-- ack/replay sync (`since_seq` or `since_time`)
-- retention/TTL policies
-- optional encrypted message blobs at rest
+- For confidentiality against servers, add end-to-end encryption later.
 
 ## Protocol Evolution (Later)
 - Current protocol is JSON over TCP for clarity and iteration speed.
-- Once behavior is stable, we may add an optional faster binary protocol.
-  - This should be a negotiated capability (e.g., `proto_bin_v1`).
-  - JSON remains supported for compatibility and debugging.
+- Later we may add an optional faster binary protocol once protocol behavior is stable.
+- Binary protocol should be capability-negotiated (for example `proto_bin_v1`).
+- JSON remains supported for compatibility and debugging.
+
+## Deferred Persistence Extensions
+- Ack/replay sync (`since_seq` or `since_time`).
+- Retention/TTL policies and compaction.
+- Optional encrypted blobs at rest.
+- User-controlled persistence tiers for channels/groups.
 
 ## Immediate Implementation Priorities
-1. Enforce owner-scoped `server_id` model in server startup/handshake.
-2. Keep live-only behavior as default and explicit.
-3. Implement RAM-only groups/channels.
+1. Keep live-only behavior as default.
+2. Keep owner-scoped `server_id` model in startup/handshake.
+3. Expand groups/channels beyond labels into explicit operations.
 4. Add/extend automated tests for:
    - signed user-to-user delivery
    - cross-server relay
-   - group/channel fanout
+   - offline queue replay for hosted identities in persist mode
    - server identity proof handshake
