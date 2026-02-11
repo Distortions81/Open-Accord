@@ -639,7 +639,7 @@ func TestPublicChannelAllowsAnyUserToInviteAndJoin(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	bob.sendAction(t, Packet{Type: "channel_invite", To: charlie.loginID, Group: "dev", Channel: "general"})
+	bob.sendAction(t, Packet{Type: "group_invite", To: charlie.loginID, Group: "dev", Channel: "general"})
 	time.Sleep(120 * time.Millisecond)
 	charlie.sendAction(t, Packet{Type: "channel_join", Group: "dev", Channel: "general"})
 	time.Sleep(120 * time.Millisecond)

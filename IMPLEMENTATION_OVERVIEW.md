@@ -21,7 +21,7 @@ Identity model:
 Implemented message classes:
 - Direct messaging: `send` -> `deliver`
 - Friend graph: `friend_add`, `friend_accept`, friend updates/requests
-- Channels/servers: `channel_create`, `channel_invite`, `channel_join`, `channel_leave`, `channel_send`
+- Channels/servers: `channel_create`, `group_invite`, `channel_join`, `channel_leave`, `channel_send`
 - Profiles: `profile_set`, `profile_get`, `profile_data`
 - Presence: `presence_keepalive`, `presence_get`, `presence_data`
 - Ping/pong path for liveness/RTT metadata

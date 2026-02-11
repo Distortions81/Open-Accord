@@ -51,6 +51,8 @@ go run ./client-tui -addr 127.0.0.1:9101
 - Signed actions with replay protection (`id` dedupe)
 - DM send/deliver
 - End-to-end encrypted DMs (client-side envelope over signed `send`)
+- Friend-handshake E2EE key exchange with Ed25519 key-binding verification
+- Multi-device E2EE support (multiple verified keys per user, capped locally)
 - Friend add/accept + friend updates
 - Channels: create, invite, join, leave, send
 - Profile set/get and cached profile cards
@@ -97,8 +99,8 @@ More options: `scripts/README.md`
 - `-listen` TCP listen address
 - `-peers` comma-separated seed peers
 - `-relay` relay signed actions between peers
-- `-tls-cert` TLS cert path (auto-generated if missing)
-- `-tls-key` TLS private key path (auto-generated if missing)
+- `-tls-cert` TLS cert path (auto-generated if missing, auto-rotated when older than 30 days)
+- `-tls-key` TLS private key path (auto-generated if missing/rotated with cert)
 - `-client-mode` `public|private|disabled`
 - `-client-allow` allowlist when `client-mode=private`
 - `-persistence-mode` `live|persist`

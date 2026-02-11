@@ -69,6 +69,23 @@ type e2eeKeyFile struct {
 	PrivateKey string `json:"private_key"`
 }
 
+type e2eeStateFile struct {
+	PeerKeys []savedPeerE2EE    `json:"peer_keys,omitempty"`
+	Nonces   []savedFriendNonce `json:"nonces,omitempty"`
+}
+
+type savedPeerE2EE struct {
+	LoginID string `json:"login_id"`
+	E2EEPub string `json:"e2ee_pub"`
+	SeenAt  int64  `json:"seen_at,omitempty"`
+}
+
+type savedFriendNonce struct {
+	LoginID string `json:"login_id"`
+	Nonce   string `json:"nonce"`
+	TS      int64  `json:"ts"`
+}
+
 type profileFile struct {
 	DisplayName   string          `json:"display_name"`
 	ProfileText   string          `json:"profile_text"`
@@ -112,6 +129,10 @@ type presenceDataPayload struct {
 
 type friendKeyPayload struct {
 	E2EEPub string `json:"e2ee_pub"`
+	PubKey  string `json:"pub_key"`
+	Sig     string `json:"sig"`
+	TS      int64  `json:"ts"`
+	Nonce   string `json:"nonce"`
 }
 
 type savedNickname struct {
@@ -172,6 +193,8 @@ const (
 	minPresenceTTLSec         = 180
 	maxPresenceTTLSec         = 900
 	defaultPresenceTTLSec     = 390
+	friendKeyMaxAge           = 30 * 24 * time.Hour
+	maxPeerKeysPerLogin       = 8
 )
 
 type presenceTickMsg struct{}
@@ -207,6 +230,8 @@ type model struct {
 	friends           map[string]struct{}
 	profilePath       string
 	uiStatePath       string
+	e2eePath          string
+	e2eeStatePath     string
 	keyPath           string
 	displayName       string
 	profileText       string
@@ -217,7 +242,9 @@ type model struct {
 	presenceTTL       map[string]int
 	presenceVisible   bool
 	presenceTTLSec    int
-	peerE2EE          map[string]string
+	peerE2EEMulti     map[string][]string
+	friendKeyNonces   map[string]map[string]int64
+	e2eeIssues        map[string]string
 	groups            map[string]map[string]struct{}
 	pendingInvites    map[string]pendingInvite
 	lastContext       chatContext
@@ -492,7 +519,7 @@ func (m *model) commandNames() []string {
 		"/servers", "/invites", "/invite-accept",
 		"/chat", "/chat-channel", "/panels", "/focus",
 		"/group", "/channel", "/clearctx", "/whoami",
-		"/friend-add", "/friend-accept",
+		"/friend-add", "/friend-accept", "/keys", "/e2ee-rotate",
 		"/channel-create", "/invite", "/channel-join", "/channel-leave", "/channel-send",
 		"/quit",
 	}
@@ -784,21 +811,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.addInfoEntry("pong from " + m.displayPeer(msg.pkt.From))
 			return m, waitNet(m.events)
-		case "friend_request", "friend_update", "channel_invite", "channel_update", "channel_joined":
+		case "friend_request", "friend_update", "group_invite", "channel_update", "channel_joined":
 			if looksLikeLoginID(msg.pkt.From) {
 				m.setPresence(msg.pkt.From, "online", defaultPresenceTTLSec)
 			}
 			if msg.pkt.Type == "friend_request" && msg.pkt.To == m.loginID && looksLikeLoginID(msg.pkt.From) {
 				m.lastFriendRequest = msg.pkt.From
-				if k := parseFriendKey(msg.pkt.Body); k != "" {
-					m.peerE2EE[msg.pkt.From] = k
+				if k, err := m.consumeFriendKey(msg.pkt.From, msg.pkt.Body); err != nil {
+					m.e2eeIssues[msg.pkt.From] = err.Error()
+					m.addInfoEntry("friend key rejected from " + m.displayPeer(msg.pkt.From) + ": " + err.Error())
+				} else if k != "" {
+					_ = addPeerKeyWithLimit(m.peerE2EEMulti, msg.pkt.From, k, maxPeerKeysPerLogin)
+					delete(m.e2eeIssues, msg.pkt.From)
+					if err := m.persistE2EEState(); err != nil {
+						m.addInfoEntry("e2ee state persist failed: " + err.Error())
+					}
 				}
 				m.requestProfile(msg.pkt.From)
 			}
 			if msg.pkt.Type == "friend_update" {
 				if looksLikeLoginID(msg.pkt.From) {
-					if k := parseFriendKey(msg.pkt.Body); k != "" {
-						m.peerE2EE[msg.pkt.From] = k
+					if k, err := m.consumeFriendKey(msg.pkt.From, msg.pkt.Body); err != nil {
+						m.e2eeIssues[msg.pkt.From] = err.Error()
+						m.addInfoEntry("friend key rejected from " + m.displayPeer(msg.pkt.From) + ": " + err.Error())
+					} else if k != "" {
+						_ = addPeerKeyWithLimit(m.peerE2EEMulti, msg.pkt.From, k, maxPeerKeysPerLogin)
+						delete(m.e2eeIssues, msg.pkt.From)
+						if err := m.persistE2EEState(); err != nil {
+							m.addInfoEntry("e2ee state persist failed: " + err.Error())
+						}
 					}
 				}
 				other := msg.pkt.From
@@ -810,7 +851,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			isInviteLikeUpdate := msg.pkt.Type == "channel_update" && strings.Contains(strings.ToLower(strings.TrimSpace(msg.pkt.Body)), "invite")
-			if (msg.pkt.Type == "channel_invite" || isInviteLikeUpdate) && strings.TrimSpace(msg.pkt.Group) != "" && strings.TrimSpace(msg.pkt.Channel) != "" {
+			if (msg.pkt.Type == "group_invite" || isInviteLikeUpdate) && strings.TrimSpace(msg.pkt.Group) != "" && strings.TrimSpace(msg.pkt.Channel) != "" {
 				key := groupChannelKey(msg.pkt.Group, msg.pkt.Channel)
 				m.pendingInvites[key] = pendingInvite{
 					From:      strings.TrimSpace(msg.pkt.From),
@@ -1269,7 +1310,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 	}
 	switch parts[0] {
 	case "/help":
-		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /profile /profile-get /presence /presence-check /servers /invites /invite-accept /group /channel /clearctx /whoami /friend-add /friend-accept /channel-create /invite /channel-join /channel-leave /channel-send /quit")
+		return logLine("commands: /to /use /chat /dm /chat-channel /panels /focus /contacts /friends /remove-contact /identities /switchid /nick /myname /profile /profile-get /presence /presence-check /servers /invites /invite-accept /group /channel /clearctx /whoami /friend-add /friend-accept /keys /e2ee-rotate /channel-create /invite /channel-join /channel-leave /channel-send /quit")
 	case "/to", "/use", "/chat", "/dm":
 		if parts[0] == "/dm" && len(parts) < 2 {
 			return logLine(m.formatDMList())
@@ -1548,6 +1589,14 @@ func (m *model) handleCommand(line string) tea.Cmd {
 			m.lastFriendRequest = ""
 		}
 		return logLine("friend accepted: " + m.displayPeer(target))
+	case "/keys":
+		return logLine(m.formatE2EEKeys())
+	case "/e2ee-rotate":
+		shared, err := m.rotateE2EEKey()
+		if err != nil {
+			return logLine("e2ee rotate failed: " + err.Error())
+		}
+		return logLine(fmt.Sprintf("e2ee key rotated; shared with %d friends", shared))
 	case "/channel-create":
 		if len(parts) < 4 {
 			return logLine("usage: /channel-create <group> <channel> <public|private>")
@@ -1578,7 +1627,7 @@ func (m *model) handleCommand(line string) tea.Cmd {
 		if !ok {
 			return logLine("unknown alias/login_id: " + strings.TrimSpace(parts[1]))
 		}
-		if err := m.sendSigned(Packet{Type: "channel_invite", To: target, Group: m.group, Channel: m.channel}); err != nil {
+		if err := m.sendSigned(Packet{Type: "group_invite", To: target, Group: m.group, Channel: m.channel}); err != nil {
 			return logLine("invite error: " + err.Error())
 		}
 		return logLine("invited " + m.displayPeer(target) + " to " + m.group + "/" + m.channel)
@@ -1791,32 +1840,192 @@ func (m *model) sendSigned(p Packet) error {
 
 func (m *model) encryptDirectMessage(target string, plaintext string) (string, error) {
 	target = strings.TrimSpace(target)
-	recipientPub := strings.TrimSpace(m.peerE2EE[target])
-	if recipientPub == "" {
-		m.requestProfile(target)
-		return "", fmt.Errorf("missing recipient e2ee key; profile refresh requested")
+	recipientPubs := append([]string(nil), m.peerE2EEMulti[target]...)
+	if len(recipientPubs) == 0 {
+		return "", fmt.Errorf("missing verified recipient e2ee key; complete friend handshake")
 	}
-	return netsec.EncryptDM(m.e2ee, recipientPub, plaintext)
+	return netsec.EncryptDMMulti(m.e2ee, recipientPubs, plaintext)
 }
 
 func (m *model) friendKeyBody() string {
 	pub := strings.TrimSpace(m.e2eeB64)
+	signingPub := strings.TrimSpace(m.pubB64)
+	signingPriv := m.priv
 	if pub == "" {
 		return ""
 	}
-	b, err := json.Marshal(friendKeyPayload{E2EEPub: pub})
+	ts := time.Now().UnixMilli()
+	nonce, err := randomNonceB64(16)
+	if err != nil {
+		return ""
+	}
+	sig := ed25519.Sign(signingPriv, friendKeyMessage(pub, ts, nonce))
+	b, err := json.Marshal(friendKeyPayload{
+		E2EEPub: pub,
+		PubKey:  signingPub,
+		Sig:     base64.StdEncoding.EncodeToString(sig),
+		TS:      ts,
+		Nonce:   nonce,
+	})
 	if err != nil {
 		return ""
 	}
 	return string(b)
 }
 
-func parseFriendKey(body string) string {
+func randomNonceB64(n int) (string, error) {
+	if n <= 0 {
+		n = 16
+	}
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf), nil
+}
+
+func friendKeyMessage(e2eePub string, ts int64, nonce string) []byte {
+	return []byte(fmt.Sprintf("friend-e2ee-key-v1:%s:%d:%s", strings.TrimSpace(e2eePub), ts, strings.TrimSpace(nonce)))
+}
+
+func parseFriendKey(body string, from string) (friendKeyPayload, bool, error) {
 	var payload friendKeyPayload
 	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &payload); err != nil {
-		return ""
+		return friendKeyPayload{}, false, nil
 	}
-	return strings.TrimSpace(payload.E2EEPub)
+	e2eePub := strings.TrimSpace(payload.E2EEPub)
+	signingPubB64 := strings.TrimSpace(payload.PubKey)
+	sigB64 := strings.TrimSpace(payload.Sig)
+	nonce := strings.TrimSpace(payload.Nonce)
+	if e2eePub == "" && signingPubB64 == "" && sigB64 == "" && nonce == "" && payload.TS == 0 {
+		return friendKeyPayload{}, false, nil
+	}
+	if e2eePub == "" || signingPubB64 == "" || sigB64 == "" || nonce == "" || payload.TS <= 0 {
+		return friendKeyPayload{}, true, fmt.Errorf("incomplete key payload")
+	}
+	pubRaw, err := base64.StdEncoding.DecodeString(signingPubB64)
+	if err != nil || len(pubRaw) != ed25519.PublicKeySize {
+		return friendKeyPayload{}, true, fmt.Errorf("invalid pubkey")
+	}
+	if loginIDForPubKey(pubRaw) != strings.TrimSpace(from) {
+		return friendKeyPayload{}, true, fmt.Errorf("identity mismatch")
+	}
+	sigRaw, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil || len(sigRaw) != ed25519.SignatureSize {
+		return friendKeyPayload{}, true, fmt.Errorf("invalid signature encoding")
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pubRaw), friendKeyMessage(e2eePub, payload.TS, nonce), sigRaw) {
+		return friendKeyPayload{}, true, fmt.Errorf("signature verify failed")
+	}
+	if payload.TS > time.Now().Add(5*time.Minute).UnixMilli() {
+		return friendKeyPayload{}, true, fmt.Errorf("timestamp too far in future")
+	}
+	if payload.TS < time.Now().Add(-friendKeyMaxAge).UnixMilli() {
+		return friendKeyPayload{}, true, fmt.Errorf("timestamp too old")
+	}
+	payload.E2EEPub = e2eePub
+	payload.Nonce = nonce
+	return payload, true, nil
+}
+
+func (m *model) consumeFriendKey(from string, body string) (string, error) {
+	payload, present, err := parseFriendKey(body, from)
+	if err != nil {
+		return "", err
+	}
+	if !present {
+		return "", nil
+	}
+	if m.friendKeyNonces[from] == nil {
+		m.friendKeyNonces[from] = make(map[string]int64)
+	}
+	if _, exists := m.friendKeyNonces[from][payload.Nonce]; exists {
+		return "", fmt.Errorf("replayed key payload")
+	}
+	if len(m.friendKeyNonces[from]) > 512 {
+		m.friendKeyNonces[from] = make(map[string]int64)
+	}
+	m.friendKeyNonces[from][payload.Nonce] = payload.TS
+	return payload.E2EEPub, nil
+}
+
+func (m *model) persistE2EEState() error {
+	path := strings.TrimSpace(m.e2eeStatePath)
+	if path == "" {
+		return nil
+	}
+	return saveE2EEState(path, m.peerE2EEMulti, m.friendKeyNonces)
+}
+
+func addPeerKeyWithLimit(m map[string][]string, loginID string, key string, limit int) bool {
+	loginID = strings.TrimSpace(loginID)
+	key = strings.TrimSpace(key)
+	if loginID == "" || key == "" {
+		return false
+	}
+	keys := m[loginID]
+	for i, k := range keys {
+		if k == key {
+			if i == 0 {
+				return false
+			}
+			copy(keys[1:i+1], keys[0:i])
+			keys[0] = key
+			m[loginID] = keys
+			return true
+		}
+	}
+	keys = append([]string{key}, keys...)
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+	m[loginID] = keys
+	return true
+}
+
+func (m *model) formatE2EEKeys() string {
+	ids := m.friendTargets()
+	if len(ids) == 0 {
+		return "e2ee keys: no friends"
+	}
+	lines := []string{"e2ee keys:"}
+	for _, id := range ids {
+		state := "missing"
+		if n := len(m.peerE2EEMulti[id]); n > 0 {
+			state = fmt.Sprintf("verified(%d)", n)
+		} else if issue := strings.TrimSpace(m.e2eeIssues[id]); issue != "" {
+			state = "invalid: " + issue
+		}
+		lines = append(lines, fmt.Sprintf("  %s [%s]", m.displayPeer(id), state))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) rotateE2EEKey() (int, error) {
+	priv, pubB64, err := netsec.NewX25519Identity()
+	if err != nil {
+		return 0, err
+	}
+	payload, err := json.MarshalIndent(e2eeKeyFile{PrivateKey: base64.StdEncoding.EncodeToString(priv.Bytes())}, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(m.e2eePath) == "" {
+		return 0, fmt.Errorf("missing e2ee key path")
+	}
+	if err := writeFileAtomic(m.e2eePath, payload, 0o600); err != nil {
+		return 0, err
+	}
+	m.e2ee = priv
+	m.e2eeB64 = pubB64
+	ids := m.friendTargets()
+	shared := 0
+	for _, id := range ids {
+		if err := m.sendSigned(Packet{Type: "friend_add", To: id, Body: m.friendKeyBody()}); err == nil {
+			shared++
+		}
+	}
+	return shared, nil
 }
 
 func encodeBodyForSend(body string) (string, string, int, error) {
@@ -2183,6 +2392,10 @@ func e2eePathForKey(home string, keyPath string) string {
 	return filepath.Join(home, ".goaccord", "e2ee", "e2ee-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
 }
 
+func e2eeStatePathForKey(home string, keyPath string) string {
+	return filepath.Join(home, ".goaccord", "e2ee", "e2ee-state-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
+}
+
 func loadOrCreateE2EEKey(path string) (*ecdh.PrivateKey, string, error) {
 	if data, err := os.ReadFile(path); err == nil {
 		var kf e2eeKeyFile
@@ -2210,6 +2423,100 @@ func loadOrCreateE2EEKey(path string) (*ecdh.PrivateKey, string, error) {
 		return nil, "", err
 	}
 	return priv, pubB64, nil
+}
+
+func loadE2EEState(path string) (map[string][]string, map[string]map[string]int64, error) {
+	peerKeys := make(map[string][]string)
+	nonces := make(map[string]map[string]int64)
+	if strings.TrimSpace(path) == "" {
+		return peerKeys, nonces, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return peerKeys, nonces, nil
+		}
+		return nil, nil, err
+	}
+	var f e2eeStateFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, nil, err
+	}
+	for _, p := range f.PeerKeys {
+		id := strings.TrimSpace(p.LoginID)
+		pub := strings.TrimSpace(p.E2EEPub)
+		if looksLikeLoginID(id) && pub != "" {
+			_ = addPeerKeyWithLimit(peerKeys, id, pub, maxPeerKeysPerLogin)
+		}
+	}
+	for _, n := range f.Nonces {
+		id := strings.TrimSpace(n.LoginID)
+		nonce := strings.TrimSpace(n.Nonce)
+		if !looksLikeLoginID(id) || nonce == "" || n.TS <= 0 {
+			continue
+		}
+		if nonces[id] == nil {
+			nonces[id] = make(map[string]int64)
+		}
+		nonces[id][nonce] = n.TS
+	}
+	return peerKeys, nonces, nil
+}
+
+func saveE2EEState(path string, peerKeys map[string][]string, nonces map[string]map[string]int64) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	ids := make([]string, 0, len(peerKeys))
+	for id := range peerKeys {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := e2eeStateFile{
+		PeerKeys: make([]savedPeerE2EE, 0, len(ids)),
+	}
+	for _, id := range ids {
+		if !looksLikeLoginID(id) {
+			continue
+		}
+		for _, key := range peerKeys[id] {
+			pub := strings.TrimSpace(key)
+			if pub == "" {
+				continue
+			}
+			out.PeerKeys = append(out.PeerKeys, savedPeerE2EE{LoginID: id, E2EEPub: pub, SeenAt: time.Now().Unix()})
+		}
+	}
+	nonceRows := make([]savedFriendNonce, 0)
+	nonceIDs := make([]string, 0, len(nonces))
+	for id := range nonces {
+		nonceIDs = append(nonceIDs, id)
+	}
+	sort.Strings(nonceIDs)
+	for _, id := range nonceIDs {
+		byNonce := nonces[id]
+		if !looksLikeLoginID(id) || len(byNonce) == 0 {
+			continue
+		}
+		keys := make([]string, 0, len(byNonce))
+		for nonce := range byNonce {
+			keys = append(keys, nonce)
+		}
+		sort.Strings(keys)
+		for _, nonce := range keys {
+			ts := byNonce[nonce]
+			if strings.TrimSpace(nonce) == "" || ts <= 0 {
+				continue
+			}
+			nonceRows = append(nonceRows, savedFriendNonce{LoginID: id, Nonce: nonce, TS: ts})
+		}
+	}
+	out.Nonces = nonceRows
+	payload, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, payload, 0o600)
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {

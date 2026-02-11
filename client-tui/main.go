@@ -53,9 +53,15 @@ func main() {
 	}
 	*keyPath = selectedKeyPath
 	e2eePath := e2eePathForKey(home, *keyPath)
+	e2eeStatePath := e2eeStatePathForKey(home, *keyPath)
 	e2eePriv, e2eePubB64, err := loadOrCreateE2EEKey(e2eePath)
 	if err != nil {
 		fmt.Printf("e2ee key load failed: %v\n", err)
+		os.Exit(1)
+	}
+	peerE2EEMulti, friendKeyNonces, err := loadE2EEState(e2eeStatePath)
+	if err != nil {
+		fmt.Printf("e2ee state load failed: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -104,6 +110,8 @@ func main() {
 		friends:         make(map[string]struct{}),
 		profilePath:     *profilePath,
 		uiStatePath:     uiStatePath,
+		e2eePath:        e2eePath,
+		e2eeStatePath:   e2eeStatePath,
 		keyPath:         *keyPath,
 		displayName:     displayName,
 		profileText:     profileText,
@@ -113,7 +121,9 @@ func main() {
 		presenceTTL:     make(map[string]int),
 		presenceVisible: true,
 		presenceTTLSec:  defaultPresenceTTLSec,
-		peerE2EE:        make(map[string]string),
+		peerE2EEMulti:   peerE2EEMulti,
+		friendKeyNonces: friendKeyNonces,
+		e2eeIssues:      make(map[string]string),
 		groups:          make(map[string]map[string]struct{}),
 		pendingInvites:  make(map[string]pendingInvite),
 		lastContext:     savedCtx,

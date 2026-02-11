@@ -105,7 +105,7 @@ Common fields:
 - `friend_add`
 - `friend_accept`
 - `channel_create`
-- `channel_invite`
+- `group_invite`
 - `channel_join`
 - `channel_leave`
 - `channel_send`
@@ -121,7 +121,7 @@ Common fields:
 - `friend_update`
 - `channel_update`
 - `channel_joined`
-- `channel_invite` (also used as server notification)
+- `group_invite` (also used as server notification)
 
 ## Action Semantics
 ### `send`
@@ -160,22 +160,35 @@ Common fields:
 
 ### DM E2EE envelope (client convention)
 - Envelope JSON in `send.body`:
-  - `v` (int) protocol version, currently `1`
-  - `alg` (string) currently `x25519-aesgcm`
+  - `v` (int) protocol version, currently `2`
+  - `alg` (string) currently `x25519-aesgcm-multi`
   - `spk` (base64) sender X25519 public key
-  - `n` (base64) AES-GCM nonce
-  - `ct` (base64) AES-GCM ciphertext
-- Clients exchange X25519 public keys via `friend_add.body` / `friend_accept.body` JSON field `e2ee_pub`.
+  - `r` (array) recipient ciphertext entries:
+    - `pk` recipient X25519 public key (base64)
+    - `n` AES-GCM nonce (base64)
+    - `ct` AES-GCM ciphertext (base64)
+- Clients exchange X25519 public keys via `friend_add.body` / `friend_accept.body` JSON payload:
+  - `e2ee_pub`: base64 X25519 public key
+  - `pub_key`: base64 Ed25519 public key
+  - `sig`: base64 Ed25519 signature over `friend-e2ee-key:<e2ee_pub>`
+  - `ts`: unix milliseconds timestamp
+  - `nonce`: base64 random nonce
+- Clients verify:
+  - `login_id(pub_key) == packet.from`
+  - signature validity for `friend-e2ee-key-v1:<e2ee_pub>:<ts>:<nonce>`
+  - `ts` is within accepted skew window (reject too-far future and stale payloads)
+  - reject replayed `nonce` for a sender.
+- Clients may store multiple verified keys per login_id (for multi-device users), capped locally (current default limit: 8 keys/login_id).
 - Clients decrypt received DM envelopes locally; nodes do not have DM plaintext.
 
 ### Friend model
 - `friend_add`:
   - requester indicates intent to friend `to`.
-  - client may include `body` JSON with E2EE key material, e.g. `{ "e2ee_pub": "<base64 x25519 pub>" }`.
+  - client may include `body` JSON with E2EE key payload (`e2ee_pub`, `pub_key`, `sig`, `ts`, `nonce`).
   - if reciprocal request already exists, friendship is established.
   - target receives `friend_request` (or both receive `friend_update` if mutual).
 - `friend_accept`:
-  - client may include `body` JSON with E2EE key material, e.g. `{ "e2ee_pub": "<base64 x25519 pub>" }`.
+  - client may include the same E2EE key payload (`e2ee_pub`, `pub_key`, `sig`, `ts`, `nonce`).
   - accept pending request from `to` -> `from` direction.
   - on success both users receive `friend_update`.
 
@@ -186,7 +199,7 @@ Channel key is `(group, channel)`.
   - required: `group`, `channel`
   - creator becomes member
   - `public=true` creates/marks channel as public
-- `channel_invite`:
+- `group_invite`:
   - required: `to`, `group`, `channel`
   - invite rules:
     - public channel: any authenticated user may invite anyone
@@ -213,7 +226,7 @@ Channel key is `(group, channel)`.
 
 ## Transport TLS
 - TLS is required for node and client transport.
-- Node generates a self-signed cert/key when missing.
+- Node auto-generates a self-signed cert/key when missing and rotates it when cert age exceeds 30 days.
 - Clients and peers connect over TLS, while identity/auth still relies on packet signatures and login IDs.
 
 ## Validation Rules

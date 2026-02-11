@@ -31,6 +31,8 @@ Optional flags:
 - `/whoami`
 - `/friend-add <login_id|alias>`
 - `/friend-accept <login_id|alias>`
+- `/keys` (show per-friend E2EE key readiness and key-count status)
+- `/e2ee-rotate` (rotate local X25519 key and re-share to friends)
 - `/profile <text>`
 - `/profile-get <login_id|alias>`
 - `/presence <visible|invisible> [ttl_sec]`
@@ -53,3 +55,4 @@ Optional flags:
 ## UI state persistence
 - TUI now persists known servers/channels and last chat context (DM or group/channel) to `<profile>.ui.json`.
 - This mirrors web UI behavior so context is restored on restart.
+- TUI persists verified peer E2EE keys and seen friend-key nonces under `~/.goaccord/e2ee/`.

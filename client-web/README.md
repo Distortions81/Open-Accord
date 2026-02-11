@@ -31,10 +31,13 @@ On startup it:
 - Profile fetch for target
 - Live chat/info event polling
 - DM target list from contacts/friends
+- DM target E2EE state (`e2ee_ready` + `e2ee_status` in target payload), including multi-key readiness for multi-device peers
 - Presence mode (`visible`/`invisible`) with periodic keepalive and TTL-based friend status checks
+- E2EE key rotation endpoint (`POST /api/e2ee/rotate`)
 
 ## Notes
 
 - Uses same signed message/auth model as `client-tui`.
 - Uses same compression behavior (`none` or `zlib`) for outgoing text payloads.
 - Uses local read-merge-atomic-write for contacts/profile files to reduce multi-instance clobbering.
+- Persists verified peer E2EE keys and seen friend-key nonces under `~/.goaccord/e2ee/`.

@@ -288,8 +288,9 @@ let activeChannel = 'default';
 let latestGroups = [];
 let latestTargets = [];
 let latestPendingFriends = [];
+let latestPendingInvites = [];
+let pendingInviteKeys = {};
 let inviteGroup = '';
-let inviteChannel = '';
 let persistContextTimer = null;
 let selfLoginID = '';
 let chatEvents = [];
@@ -358,6 +359,46 @@ function renderChat() {
     row.appendChild(ts);
     row.appendChild(name);
     row.appendChild(msg);
+    if (ev.invite_key && pendingInviteKeys[ev.invite_key]) {
+      const actions = document.createElement('span');
+      actions.style.display = 'inline-flex';
+      actions.style.gap = '6px';
+      actions.style.marginLeft = '8px';
+      const accept = document.createElement('button');
+      accept.type = 'button';
+      accept.className = 'row-icon-btn';
+      accept.textContent = 'Accept';
+      accept.onclick = async () => {
+        try {
+          await post('/api/invite/accept', {invite_key: ev.invite_key});
+          await poll();
+        } catch (e) { appendInfo(`invite-accept failed: ${e.message}`); }
+      };
+      const ignore = document.createElement('button');
+      ignore.type = 'button';
+      ignore.className = 'row-icon-btn';
+      ignore.textContent = 'Ignore';
+      ignore.onclick = async () => {
+        try {
+          await post('/api/invite/ignore', {invite_key: ev.invite_key});
+          await poll();
+        } catch (e) { appendInfo(`invite-ignore failed: ${e.message}`); }
+      };
+      const reject = document.createElement('button');
+      reject.type = 'button';
+      reject.className = 'row-icon-btn';
+      reject.textContent = 'Reject';
+      reject.onclick = async () => {
+        try {
+          await post('/api/invite/reject', {invite_key: ev.invite_key});
+          await poll();
+        } catch (e) { appendInfo(`invite-reject failed: ${e.message}`); }
+      };
+      actions.appendChild(accept);
+      actions.appendChild(ignore);
+      actions.appendChild(reject);
+      row.appendChild(actions);
+    }
     chatEl.appendChild(row);
   }
   while (chatEl.childElementCount > 500) {
@@ -664,6 +705,17 @@ function renderTargets(targets, pendingFriends) {
   if (changed) persistContextSoon();
 }
 
+function updatePendingInvites(invites) {
+  latestPendingInvites = Array.isArray(invites) ? invites : [];
+  pendingInviteKeys = {};
+  for (const inv of latestPendingInvites) {
+    const key = (inv.invite_key || '').trim();
+    if (!key) continue;
+    pendingInviteKeys[key] = true;
+  }
+  renderChat();
+}
+
 function openCreateServerDialog() {
   const name = window.prompt('Server/Group name');
   const group = (name || '').trim();
@@ -680,10 +732,9 @@ function openCreateServerDialog() {
     .catch((e) => appendInfo(`group-create failed: ${e.message}`));
 }
 
-function openInviteDialog(group, channel) {
+function openInviteDialog(group) {
   inviteGroup = (group || '').trim();
-  inviteChannel = (channel || 'default').trim() || 'default';
-  inviteTitle.textContent = `Invite to ${inviteGroup}/${inviteChannel}`;
+  inviteTitle.textContent = `Invite to ${inviteGroup}`;
   inviteList.innerHTML = '';
   const items = (latestTargets || []).filter((t) => t && t.id);
   if (items.length === 0) {
@@ -749,6 +800,23 @@ function renderGroups(groups) {
     if (gUnread > 0) {
       row.appendChild(createUnreadBadge(gUnread));
     }
+    const infoBtn = document.createElement('button');
+    infoBtn.type = 'button';
+    infoBtn.className = 'row-icon-btn';
+    infoBtn.title = 'Server owner info';
+    infoBtn.textContent = 'i';
+    infoBtn.onclick = async (ev) => {
+      ev.stopPropagation();
+      const ownerID = (g.owner_id || '').trim();
+      const ownerLabel = (g.owner_label || '').trim();
+      if (!ownerID) {
+        appendInfo(`server '${g.name || ''}' owner: unknown`);
+        return;
+      }
+      appendInfo(`server '${g.name || ''}' owner: ${ownerLabel || ownerID} (${ownerID})`);
+      try { await openProfileCard(ownerID); } catch (_) {}
+    };
+    row.appendChild(infoBtn);
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'row-icon-btn';
@@ -817,7 +885,7 @@ function renderChannels() {
     invite.textContent = 'Invite';
     invite.onclick = (ev) => {
       ev.stopPropagation();
-      openInviteDialog(activeGroup, ch);
+      openInviteDialog(activeGroup);
     };
     row.appendChild(invite);
     channelList.appendChild(row);
@@ -840,6 +908,7 @@ async function bootstrap() {
   document.getElementById('displayName').value = data.display_name || '';
   document.getElementById('profileText').value = data.profile_text || '';
   renderTargets(data.targets || [], data.pending_friends || []);
+  updatePendingInvites(data.pending_invites || []);
   renderGroups(data.groups || []);
   const last = data.last_context || {};
   if (last.mode === 'group') {
@@ -852,6 +921,7 @@ async function bootstrap() {
     activeChannel = 'default';
   }
   renderTargets(latestTargets, data.pending_friends || []);
+  updatePendingInvites(data.pending_invites || []);
   renderGroups(latestGroups);
   updateChatContext();
   await post('/api/presence/check', {});
@@ -862,6 +932,7 @@ async function poll() {
   try {
     const res = await fetch('/api/events?since=' + since);
     const data = await res.json();
+    if (data.pending_invites) updatePendingInvites(data.pending_invites || []);
     for (const ev of (data.events || [])) {
       since = Math.max(since, ev.seq || 0);
       if (ev.kind === 'chat') appendChat(ev);
@@ -945,7 +1016,7 @@ document.getElementById('inviteSend').onclick = async () => {
   const checked = Array.from(inviteList.querySelectorAll('input[type="checkbox"]:checked')).map((el) => el.value);
   if (checked.length === 0) return;
   try {
-    await post('/api/group/invite', {group: inviteGroup, channel: inviteChannel, to: checked});
+    await post('/api/group/invite', {group: inviteGroup, to: checked});
     inviteEditor.hidden = true;
   } catch (e) { appendInfo(`group-invite failed: ${e.message}`); }
 };

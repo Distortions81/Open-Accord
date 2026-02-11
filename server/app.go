@@ -1109,7 +1109,7 @@ func (s *Server) isUserOnline(loginID string) bool {
 
 func isSignedActionType(typ string) bool {
 	switch typ {
-	case "send", "ping", "pong", "friend_add", "friend_accept", "channel_create", "channel_invite", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get", "presence_keepalive":
+	case "send", "ping", "pong", "friend_add", "friend_accept", "channel_create", "group_invite", "group_invite_reject", "channel_join", "channel_leave", "channel_send", "profile_set", "profile_get", "presence_keepalive":
 		return true
 	default:
 		return false
@@ -1129,8 +1129,10 @@ func validateSignedActionPacket(p Packet) bool {
 		return strings.TrimSpace(p.To) != ""
 	case "channel_create":
 		return strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != ""
-	case "channel_invite":
-		return strings.TrimSpace(p.To) != "" && strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != ""
+	case "group_invite":
+		return strings.TrimSpace(p.To) != "" && strings.TrimSpace(p.Group) != ""
+	case "group_invite_reject":
+		return strings.TrimSpace(p.To) != "" && strings.TrimSpace(p.Group) != ""
 	case "channel_join", "channel_leave":
 		return strings.TrimSpace(p.Group) != "" && strings.TrimSpace(p.Channel) != ""
 	case "channel_send":
@@ -1216,6 +1218,18 @@ func channelKey(group string, channel string) string {
 	return strings.TrimSpace(group) + "/" + strings.TrimSpace(channel)
 }
 
+func splitChannelKey(key string) (group string, channel string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", ""
+	}
+	i := strings.Index(key, "/")
+	if i < 0 {
+		return key, ""
+	}
+	return key[:i], key[i+1:]
+}
+
 func (s *Server) isFriend(a, b string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1252,6 +1266,13 @@ func (s *Server) handleFriendAdd(p Packet) {
 		return
 	}
 	s.mu.Lock()
+	if links := s.friends[p.From]; links != nil {
+		if _, alreadyFriends := links[p.To]; alreadyFriends {
+			s.mu.Unlock()
+			s.notifyUserOrQueue(Packet{Type: "friend_update", From: p.From, To: p.To, Body: p.Body})
+			return
+		}
+	}
 	if s.friendAdds[p.From] == nil {
 		s.friendAdds[p.From] = make(map[string]struct{})
 	}
@@ -1302,6 +1323,16 @@ func (s *Server) handleChannelCreate(p Packet) {
 	ch := s.channels[key]
 	if ch == nil {
 		ch = &ChannelState{Owner: p.From, Public: p.Public, Members: make(map[string]struct{}), Invites: make(map[string]string)}
+		group := strings.TrimSpace(p.Group)
+		for existingKey, existing := range s.channels {
+			existingGroup, _ := splitChannelKey(existingKey)
+			if existingGroup != group {
+				continue
+			}
+			for member := range existing.Members {
+				ch.Members[member] = struct{}{}
+			}
+		}
 		s.channels[key] = ch
 	}
 	ch.Members[p.From] = struct{}{}
@@ -1317,24 +1348,35 @@ func (s *Server) handleChannelInvite(p Packet) {
 	if p.From == p.To {
 		return
 	}
-	key := channelKey(p.Group, p.Channel)
-	s.mu.Lock()
-	ch := s.channels[key]
-	if ch == nil {
-		// Allow invite propagation across peers even if this node has not yet
-		// observed an explicit channel_create for the same channel.
-		ch = &ChannelState{
-			Owner:   p.From,
-			Public:  p.Public,
-			Members: make(map[string]struct{}),
-			Invites: make(map[string]string),
-		}
-		ch.Members[p.From] = struct{}{}
-		s.channels[key] = ch
+	group := strings.TrimSpace(p.Group)
+	if group == "" {
+		return
 	}
-	_, inviterIsMember := ch.Members[p.From]
-	canInvite := ch.Public || inviterIsMember
-	if !ch.Public && inviterIsMember && p.From != ch.Owner {
+	s.mu.Lock()
+	channels := make([]*ChannelState, 0)
+	channelNames := make([]string, 0)
+	inviterIsMember := false
+	inviterOwnsAny := false
+	groupIsPublic := false
+	for key, ch := range s.channels {
+		g, chName := splitChannelKey(key)
+		if g != group {
+			continue
+		}
+		channels = append(channels, ch)
+		channelNames = append(channelNames, chName)
+		if _, ok := ch.Members[p.From]; ok {
+			inviterIsMember = true
+		}
+		if strings.TrimSpace(ch.Owner) == p.From {
+			inviterOwnsAny = true
+		}
+		if ch.Public {
+			groupIsPublic = true
+		}
+	}
+	canInvite := groupIsPublic || inviterIsMember
+	if !groupIsPublic && inviterIsMember && !inviterOwnsAny {
 		links := s.friends[p.From]
 		if links == nil {
 			canInvite = false
@@ -1342,15 +1384,40 @@ func (s *Server) handleChannelInvite(p Packet) {
 			canInvite = false
 		}
 	}
-	if canInvite {
-		ch.Invites[p.To] = p.From
+	if canInvite && len(channels) > 0 {
+		for _, ch := range channels {
+			ch.Invites[p.To] = p.From
+		}
 	}
-	publicChannel := ch.Public
 	s.mu.Unlock()
-	if !canInvite {
+	if !canInvite || len(channels) == 0 {
 		return
 	}
-	s.notifyUserOrQueue(Packet{Type: "channel_invite", From: p.From, To: p.To, Group: p.Group, Channel: p.Channel, Public: publicChannel, Body: "invite"})
+	sort.Strings(channelNames)
+	payload, _ := json.Marshal(map[string]any{"scope": "group", "channels": channelNames})
+	s.notifyUserOrQueue(Packet{Type: "group_invite", From: p.From, To: p.To, Group: p.Group, Channel: "", Public: groupIsPublic, Body: string(payload)})
+}
+
+func (s *Server) handleChannelInviteReject(p Packet) {
+	if p.From == p.To {
+		return
+	}
+	group := strings.TrimSpace(p.Group)
+	if group == "" {
+		return
+	}
+	s.mu.Lock()
+	for key, ch := range s.channels {
+		g, _ := splitChannelKey(key)
+		if g != group {
+			continue
+		}
+		if inviter, ok := ch.Invites[p.From]; ok && inviter == p.To {
+			delete(ch.Invites, p.From)
+		}
+	}
+	s.mu.Unlock()
+	s.notifyUserOrQueue(Packet{Type: "group_invite_rejected", From: p.From, To: p.To, Group: p.Group, Channel: "", Body: "rejected"})
 }
 
 func (s *Server) handleChannelJoin(p Packet) {
@@ -1359,19 +1426,49 @@ func (s *Server) handleChannelJoin(p Packet) {
 	ch := s.channels[key]
 	if ch == nil {
 		s.mu.Unlock()
+		_ = s.sendToUser(p.From, Packet{Type: "error", From: s.id, To: p.From, Body: "channel_join failed: unknown channel", Origin: s.id})
 		return
 	}
 	_, member := ch.Members[p.From]
 	_, invited := ch.Invites[p.From]
-	if member || ch.Public || invited {
-		ch.Members[p.From] = struct{}{}
-		delete(ch.Invites, p.From)
+	group := strings.TrimSpace(p.Group)
+	groupInvited := false
+	groupChannels := make([]*ChannelState, 0)
+	groupChannelNames := make([]string, 0)
+	for existingKey, existing := range s.channels {
+		g, chName := splitChannelKey(existingKey)
+		if g != group {
+			continue
+		}
+		groupChannels = append(groupChannels, existing)
+		groupChannelNames = append(groupChannelNames, chName)
+		if _, ok := existing.Invites[p.From]; ok {
+			groupInvited = true
+		}
+	}
+	if member || ch.Public || invited || groupInvited {
+		joinedChannels := make([]string, 0, len(groupChannelNames))
+		if invited || groupInvited {
+			for i, gc := range groupChannels {
+				gc.Members[p.From] = struct{}{}
+				delete(gc.Invites, p.From)
+				joinedChannels = append(joinedChannels, groupChannelNames[i])
+			}
+		} else {
+			ch.Members[p.From] = struct{}{}
+			delete(ch.Invites, p.From)
+			joinedChannels = append(joinedChannels, strings.TrimSpace(p.Channel))
+		}
 		publicChannel := ch.Public
 		s.mu.Unlock()
-		s.notifyUserOrQueue(Packet{Type: "channel_joined", From: p.From, To: p.From, Group: p.Group, Channel: p.Channel, Public: publicChannel, Body: "joined"})
+		sort.Strings(joinedChannels)
+		for _, joined := range joinedChannels {
+			s.notifyUserOrQueue(Packet{Type: "channel_joined", From: p.From, To: p.From, Group: p.Group, Channel: joined, Public: publicChannel, Body: "joined"})
+		}
 		return
 	}
 	s.mu.Unlock()
+	_ = s.sendToUser(p.From, Packet{Type: "error", From: s.id, To: p.From, Body: "channel_join failed: invite required", Origin: s.id})
 }
 
 func (s *Server) handleChannelLeave(p Packet) {
@@ -1390,10 +1487,12 @@ func (s *Server) handleChannelSend(p Packet) {
 	ch := s.channels[key]
 	if ch == nil {
 		s.mu.RUnlock()
+		_ = s.sendToUser(p.From, Packet{Type: "error", From: s.id, To: p.From, Body: "channel_send failed: unknown channel", Origin: s.id})
 		return
 	}
 	if _, ok := ch.Members[p.From]; !ok {
 		s.mu.RUnlock()
+		_ = s.sendToUser(p.From, Packet{Type: "error", From: s.id, To: p.From, Body: "channel_send failed: not a member", Origin: s.id})
 		return
 	}
 	members := make([]string, 0, len(ch.Members))
@@ -1508,9 +1607,12 @@ func (s *Server) processSignedAction(p Packet) {
 	case "channel_create":
 		s.maybeRememberTopology(p)
 		s.handleChannelCreate(p)
-	case "channel_invite":
+	case "group_invite":
 		s.maybeRememberTopology(p)
 		s.handleChannelInvite(p)
+	case "group_invite_reject":
+		s.maybeRememberTopology(p)
+		s.handleChannelInviteReject(p)
 	case "channel_join":
 		s.maybeRememberTopology(p)
 		s.handleChannelJoin(p)

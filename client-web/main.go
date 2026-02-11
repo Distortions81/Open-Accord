@@ -82,6 +82,23 @@ type e2eeKeyFile struct {
 	PrivateKey string `json:"private_key"`
 }
 
+type e2eeStateFile struct {
+	PeerKeys []savedPeerE2EE    `json:"peer_keys,omitempty"`
+	Nonces   []savedFriendNonce `json:"nonces,omitempty"`
+}
+
+type savedPeerE2EE struct {
+	LoginID string `json:"login_id"`
+	E2EEPub string `json:"e2ee_pub"`
+	SeenAt  int64  `json:"seen_at,omitempty"`
+}
+
+type savedFriendNonce struct {
+	LoginID string `json:"login_id"`
+	Nonce   string `json:"nonce"`
+	TS      int64  `json:"ts"`
+}
+
 type profileFile struct {
 	DisplayName   string          `json:"display_name"`
 	ProfileText   string          `json:"profile_text"`
@@ -131,6 +148,10 @@ type presenceDataPayload struct {
 
 type friendKeyPayload struct {
 	E2EEPub string `json:"e2ee_pub"`
+	PubKey  string `json:"pub_key"`
+	Sig     string `json:"sig"`
+	TS      int64  `json:"ts"`
+	Nonce   string `json:"nonce"`
 }
 
 type contactsFile struct {
@@ -172,6 +193,7 @@ type webEvent struct {
 	Target     string `json:"target,omitempty"`  // dm target
 	Group      string `json:"group,omitempty"`   // group context
 	Channel    string `json:"channel,omitempty"` // channel context
+	InviteKey  string `json:"invite_key,omitempty"`
 }
 
 type dmTarget struct {
@@ -182,12 +204,25 @@ type dmTarget struct {
 	LastRefreshed int64  `json:"last_refreshed,omitempty"`
 	Online        string `json:"online,omitempty"`
 	OnlineTTLSec  int    `json:"online_ttl_sec,omitempty"`
+	E2EEReady     bool   `json:"e2ee_ready"`
+	E2EEStatus    string `json:"e2ee_status,omitempty"`
+}
+
+type channelInviteEntry struct {
+	FromID     string `json:"from_id"`
+	FromLabel  string `json:"from_label"`
+	Group      string `json:"group"`
+	Channel    string `json:"channel"`
+	ReceivedAt int64  `json:"received_at"`
+	InviteKey  string `json:"invite_key"`
 }
 
 type groupEntry struct {
-	Name     string   `json:"name"`
-	Channels []string `json:"channels,omitempty"`
-	Owned    bool     `json:"owned,omitempty"`
+	Name       string   `json:"name"`
+	Channels   []string `json:"channels,omitempty"`
+	Owned      bool     `json:"owned,omitempty"`
+	OwnerID    string   `json:"owner_id,omitempty"`
+	OwnerLabel string   `json:"owner_label,omitempty"`
 }
 
 type webClient struct {
@@ -200,12 +235,14 @@ type webClient struct {
 	e2ee    *ecdh.PrivateKey
 	e2eeB64 string
 
-	loginID      string
-	displayName  string
-	profileText  string
-	contactsPath string
-	profilePath  string
-	uiStatePath  string
+	loginID       string
+	displayName   string
+	profileText   string
+	contactsPath  string
+	profilePath   string
+	uiStatePath   string
+	e2eePath      string
+	e2eeStatePath string
 
 	contacts         map[string]string
 	nicknames        map[string]string
@@ -217,12 +254,16 @@ type webClient struct {
 	presenceTTLSec   int
 	friends          map[string]struct{}
 	pendingFriends   map[string]int64
+	pendingInvites   map[string]channelInviteEntry
 	groups           map[string]map[string]struct{}
 	ownedGroups      map[string]struct{}
+	groupOwners      map[string]string
 	lastContext      chatContext
 	pendingPings     map[string]int64
 	seenChatIDs      map[string]struct{}
-	peerE2EE         map[string]string
+	peerE2EEMulti    map[string][]string
+	friendKeyNonces  map[string]map[string]int64
+	e2eeIssues       map[string]string
 
 	events  []webEvent
 	nextSeq int64
@@ -242,6 +283,8 @@ const (
 	minPresenceTTLSec         = 180
 	maxPresenceTTLSec         = 900
 	defaultPresenceTTLSec     = 390
+	friendKeyMaxAge           = 30 * 24 * time.Hour
+	maxPeerKeysPerLogin       = 8
 )
 
 func stamp() string { return time.Now().Format("15:04:05") }
@@ -297,6 +340,28 @@ func (c *webClient) addChatEventWithActor(text string, actorID string, mode stri
 	}
 	if e.Mode == "group" && e.Channel == "" {
 		e.Channel = "default"
+	}
+	c.events = append(c.events, e)
+	if len(c.events) > 1000 {
+		c.events = c.events[len(c.events)-1000:]
+	}
+}
+
+func (c *webClient) addInviteChatEvent(text string, actorID string, target string, inviteKey string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextSeq++
+	actorID = strings.TrimSpace(actorID)
+	e := webEvent{
+		Seq:        c.nextSeq,
+		Kind:       "chat",
+		Text:       text,
+		TS:         stamp(),
+		ActorID:    actorID,
+		ActorLabel: c.displayPeerLocked(actorID),
+		Mode:       "dm",
+		Target:     strings.TrimSpace(target),
+		InviteKey:  strings.TrimSpace(inviteKey),
 	}
 	c.events = append(c.events, e)
 	if len(c.events) > 1000 {
@@ -475,36 +540,174 @@ func (c *webClient) publishOwnProfile() error {
 
 func (c *webClient) encryptDirectMessage(target string, plaintext string) (string, error) {
 	c.mu.Lock()
-	recipientPub := strings.TrimSpace(c.peerE2EE[target])
+	recipientPubs := append([]string(nil), c.peerE2EEMulti[target]...)
 	e2eePriv := c.e2ee
 	c.mu.Unlock()
-	if recipientPub == "" {
-		c.requestProfile(target)
-		return "", fmt.Errorf("missing recipient e2ee key; profile refresh requested")
+	if len(recipientPubs) == 0 {
+		return "", fmt.Errorf("missing verified recipient e2ee key; complete friend handshake")
 	}
-	return netsec.EncryptDM(e2eePriv, recipientPub, plaintext)
+	return netsec.EncryptDMMulti(e2eePriv, recipientPubs, plaintext)
 }
 
 func (c *webClient) friendKeyBody() string {
 	c.mu.Lock()
 	pub := strings.TrimSpace(c.e2eeB64)
+	signingPub := strings.TrimSpace(c.pubB64)
+	signingPriv := c.priv
 	c.mu.Unlock()
 	if pub == "" {
 		return ""
 	}
-	b, err := json.Marshal(friendKeyPayload{E2EEPub: pub})
+	ts := time.Now().UnixMilli()
+	nonce, err := randomNonceB64(16)
+	if err != nil {
+		return ""
+	}
+	sig := ed25519.Sign(signingPriv, friendKeyMessage(pub, ts, nonce))
+	b, err := json.Marshal(friendKeyPayload{
+		E2EEPub: pub,
+		PubKey:  signingPub,
+		Sig:     base64.StdEncoding.EncodeToString(sig),
+		TS:      ts,
+		Nonce:   nonce,
+	})
 	if err != nil {
 		return ""
 	}
 	return string(b)
 }
 
-func parseFriendKey(body string) string {
+func randomNonceB64(n int) (string, error) {
+	if n <= 0 {
+		n = 16
+	}
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf), nil
+}
+
+func friendKeyMessage(e2eePub string, ts int64, nonce string) []byte {
+	return []byte(fmt.Sprintf("friend-e2ee-key-v1:%s:%d:%s", strings.TrimSpace(e2eePub), ts, strings.TrimSpace(nonce)))
+}
+
+func parseFriendKey(body string, from string) (friendKeyPayload, bool, error) {
 	var payload friendKeyPayload
 	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &payload); err != nil {
-		return ""
+		return friendKeyPayload{}, false, nil
 	}
-	return strings.TrimSpace(payload.E2EEPub)
+	e2eePub := strings.TrimSpace(payload.E2EEPub)
+	signingPubB64 := strings.TrimSpace(payload.PubKey)
+	sigB64 := strings.TrimSpace(payload.Sig)
+	nonce := strings.TrimSpace(payload.Nonce)
+	if e2eePub == "" && signingPubB64 == "" && sigB64 == "" && nonce == "" && payload.TS == 0 {
+		return friendKeyPayload{}, false, nil
+	}
+	if e2eePub == "" || signingPubB64 == "" || sigB64 == "" || nonce == "" || payload.TS <= 0 {
+		return friendKeyPayload{}, true, fmt.Errorf("incomplete key payload")
+	}
+	pubRaw, err := base64.StdEncoding.DecodeString(signingPubB64)
+	if err != nil || len(pubRaw) != ed25519.PublicKeySize {
+		return friendKeyPayload{}, true, fmt.Errorf("invalid pubkey")
+	}
+	if loginIDForPubKey(pubRaw) != strings.TrimSpace(from) {
+		return friendKeyPayload{}, true, fmt.Errorf("identity mismatch")
+	}
+	sigRaw, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil || len(sigRaw) != ed25519.SignatureSize {
+		return friendKeyPayload{}, true, fmt.Errorf("invalid signature encoding")
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pubRaw), friendKeyMessage(e2eePub, payload.TS, nonce), sigRaw) {
+		return friendKeyPayload{}, true, fmt.Errorf("signature verify failed")
+	}
+	if payload.TS > time.Now().Add(5*time.Minute).UnixMilli() {
+		return friendKeyPayload{}, true, fmt.Errorf("timestamp too far in future")
+	}
+	if payload.TS < time.Now().Add(-friendKeyMaxAge).UnixMilli() {
+		return friendKeyPayload{}, true, fmt.Errorf("timestamp too old")
+	}
+	payload.E2EEPub = e2eePub
+	payload.Nonce = nonce
+	return payload, true, nil
+}
+
+func (c *webClient) consumeFriendKey(from string, body string) (string, error) {
+	payload, present, err := parseFriendKey(body, from)
+	if err != nil {
+		return "", err
+	}
+	if !present {
+		return "", nil
+	}
+	c.mu.Lock()
+	if c.friendKeyNonces[from] == nil {
+		c.friendKeyNonces[from] = make(map[string]int64)
+	}
+	if _, exists := c.friendKeyNonces[from][payload.Nonce]; exists {
+		c.mu.Unlock()
+		return "", fmt.Errorf("replayed key payload")
+	}
+	if len(c.friendKeyNonces[from]) > 512 {
+		c.friendKeyNonces[from] = make(map[string]int64)
+	}
+	c.friendKeyNonces[from][payload.Nonce] = payload.TS
+	c.mu.Unlock()
+	return payload.E2EEPub, nil
+}
+
+func (c *webClient) persistE2EEState() error {
+	c.mu.Lock()
+	path := strings.TrimSpace(c.e2eeStatePath)
+	peer := cloneMultiStringMap(c.peerE2EEMulti)
+	nonces := cloneNonceMap(c.friendKeyNonces)
+	c.mu.Unlock()
+	if path == "" {
+		return nil
+	}
+	return saveE2EEState(path, peer, nonces)
+}
+
+func cloneMultiStringMap(m map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(m))
+	for k, v := range m {
+		cp := make([]string, 0, len(v))
+		for _, s := range v {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				cp = append(cp, s)
+			}
+		}
+		out[k] = cp
+	}
+	return out
+}
+
+func addPeerKeyWithLimit(m map[string][]string, loginID string, key string, limit int) bool {
+	loginID = strings.TrimSpace(loginID)
+	key = strings.TrimSpace(key)
+	if loginID == "" || key == "" {
+		return false
+	}
+	keys := m[loginID]
+	// Move existing key to the front.
+	for i, k := range keys {
+		if k == key {
+			if i == 0 {
+				return false
+			}
+			copy(keys[1:i+1], keys[0:i])
+			keys[0] = key
+			m[loginID] = keys
+			return true
+		}
+	}
+	keys = append([]string{key}, keys...)
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+	m[loginID] = keys
+	return true
 }
 
 func (c *webClient) upsertNickname(loginID, nick string) {
@@ -566,6 +769,8 @@ func (c *webClient) forgetGroup(group string) {
 	}
 	c.mu.Lock()
 	delete(c.groups, group)
+	delete(c.ownedGroups, group)
+	delete(c.groupOwners, group)
 	c.mu.Unlock()
 	c.persistUIState()
 }
@@ -696,19 +901,91 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 				c.setPresence(p.From, "online", defaultPresenceTTLSec)
 				c.mu.Lock()
 				c.pendingFriends[p.From] = time.Now().Unix()
-				if k := parseFriendKey(p.Body); k != "" {
-					c.peerE2EE[p.From] = k
-				}
 				c.mu.Unlock()
+				if k, err := c.consumeFriendKey(p.From, p.Body); err != nil {
+					c.mu.Lock()
+					c.e2eeIssues[p.From] = err.Error()
+					c.mu.Unlock()
+					c.addEvent("info", "friend key rejected from "+c.displayPeer(p.From)+": "+err.Error())
+				} else if k != "" {
+					c.mu.Lock()
+					_ = addPeerKeyWithLimit(c.peerE2EEMulti, p.From, k, maxPeerKeysPerLogin)
+					delete(c.e2eeIssues, p.From)
+					c.mu.Unlock()
+					if err := c.persistE2EEState(); err != nil {
+						c.addEvent("info", "e2ee state persist failed: "+err.Error())
+					}
+				}
 				c.requestProfile(p.From)
 			}
 			c.addEvent("info", fmt.Sprintf("friend request from %s", c.displayPeer(p.From)))
-		case "friend_update", "channel_invite", "channel_update", "channel_joined":
+		case "friend_update", "group_invite", "channel_update", "channel_joined", "group_invite_rejected":
 			if looksLikeLoginID(p.From) {
 				c.setPresence(p.From, "online", defaultPresenceTTLSec)
 			}
 			if strings.TrimSpace(p.Group) != "" {
-				c.rememberGroup(p.Group, p.Channel)
+				if p.Type != "group_invite" {
+					c.rememberGroup(p.Group, p.Channel)
+				}
+				if looksLikeLoginID(p.From) {
+					c.mu.Lock()
+					if _, ok := c.groupOwners[strings.TrimSpace(p.Group)]; !ok || p.Type == "channel_update" {
+						c.groupOwners[strings.TrimSpace(p.Group)] = strings.TrimSpace(p.From)
+					}
+					c.mu.Unlock()
+				}
+			}
+			if p.Type == "group_invite" && p.To == c.loginID && strings.TrimSpace(p.Group) != "" {
+				group := strings.TrimSpace(p.Group)
+				from := strings.TrimSpace(p.From)
+				channels := make([]string, 0)
+				if strings.TrimSpace(p.Body) != "" {
+					var payload struct {
+						Channels []string `json:"channels"`
+					}
+					if err := json.Unmarshal([]byte(strings.TrimSpace(p.Body)), &payload); err == nil {
+						for _, ch := range payload.Channels {
+							ch = strings.TrimSpace(ch)
+							if ch == "" {
+								continue
+							}
+							channels = append(channels, ch)
+						}
+					}
+				}
+				c.mu.Lock()
+				if looksLikeLoginID(from) && from != c.loginID {
+					c.contacts[shortID(from)] = from
+				}
+				key := channelInviteKey(from, group)
+				c.pendingInvites[key] = channelInviteEntry{
+					FromID:     from,
+					Group:      group,
+					Channel:    "",
+					ReceivedAt: time.Now().Unix(),
+				}
+				contacts := cloneStringMap(c.contacts)
+				c.mu.Unlock()
+				_ = saveContacts(c.contactsPath, contacts)
+				msg := fmt.Sprintf("invited you to group %s", group)
+				if len(channels) > 0 {
+					msg += " channels: " + strings.Join(channels, ", ")
+				}
+				c.addInviteChatEvent(msg, p.From, strings.TrimSpace(p.From), key)
+			}
+			if p.Type == "channel_joined" && p.To == c.loginID && strings.TrimSpace(p.Group) != "" {
+				group := strings.TrimSpace(p.Group)
+				c.mu.Lock()
+				for key, inv := range c.pendingInvites {
+					if normalizeGroupName(inv.Group) == group {
+						delete(c.pendingInvites, key)
+					}
+				}
+				c.mu.Unlock()
+			}
+			if p.Type == "group_invite_rejected" && p.To == c.loginID && strings.TrimSpace(p.Group) != "" {
+				group := strings.TrimSpace(p.Group)
+				c.addEvent("info", fmt.Sprintf("group invite rejected by %s for %s", c.displayPeer(p.From), group))
 			}
 			if p.Type == "channel_update" && p.From == c.loginID {
 				body := strings.ToLower(strings.TrimSpace(p.Body))
@@ -721,10 +998,19 @@ func (c *webClient) networkLoop(ch <-chan netMsg) {
 			}
 			if p.Type == "friend_update" {
 				if looksLikeLoginID(p.From) {
-					if k := parseFriendKey(p.Body); k != "" {
+					if k, err := c.consumeFriendKey(p.From, p.Body); err != nil {
 						c.mu.Lock()
-						c.peerE2EE[p.From] = k
+						c.e2eeIssues[p.From] = err.Error()
 						c.mu.Unlock()
+						c.addEvent("info", "friend key rejected from "+c.displayPeer(p.From)+": "+err.Error())
+					} else if k != "" {
+						c.mu.Lock()
+						_ = addPeerKeyWithLimit(c.peerE2EEMulti, p.From, k, maxPeerKeysPerLogin)
+						delete(c.e2eeIssues, p.From)
+						c.mu.Unlock()
+						if err := c.persistE2EEState(); err != nil {
+							c.addEvent("info", "e2ee state persist failed: "+err.Error())
+						}
 					}
 				}
 				other := p.From
@@ -876,6 +1162,31 @@ func cloneSet(m map[string]struct{}) map[string]struct{} {
 	return out
 }
 
+func cloneNonceMap(m map[string]map[string]int64) map[string]map[string]int64 {
+	out := make(map[string]map[string]int64, len(m))
+	for id, byNonce := range m {
+		inner := make(map[string]int64, len(byNonce))
+		for nonce, ts := range byNonce {
+			inner[nonce] = ts
+		}
+		out[id] = inner
+	}
+	return out
+}
+
+func (c *webClient) e2eeStatusLocked(loginID string) string {
+	if len(c.peerE2EEMulti[loginID]) > 0 {
+		if len(c.peerE2EEMulti[loginID]) == 1 {
+			return "verified(1)"
+		}
+		return fmt.Sprintf("verified(%d)", len(c.peerE2EEMulti[loginID]))
+	}
+	if issue := strings.TrimSpace(c.e2eeIssues[loginID]); issue != "" {
+		return "invalid: " + issue
+	}
+	return "missing"
+}
+
 func (c *webClient) dmTargets() []dmTarget {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -907,6 +1218,8 @@ func (c *webClient) dmTargets() []dmTarget {
 			LastRefreshed: c.profileRefreshed[id],
 			Online:        strings.TrimSpace(c.presence[id]),
 			OnlineTTLSec:  c.presenceTTL[id],
+			E2EEReady:     len(c.peerE2EEMulti[id]) > 0,
+			E2EEStatus:    c.e2eeStatusLocked(id),
 		})
 	}
 	return out
@@ -935,8 +1248,35 @@ func (c *webClient) pendingFriendRequests() []dmTarget {
 			LastRefreshed: c.pendingFriends[id],
 			Online:        strings.TrimSpace(c.presence[id]),
 			OnlineTTLSec:  c.presenceTTL[id],
+			E2EEReady:     len(c.peerE2EEMulti[id]) > 0,
+			E2EEStatus:    c.e2eeStatusLocked(id),
 		})
 	}
+	return out
+}
+
+func (c *webClient) pendingChannelInvites() []channelInviteEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]channelInviteEntry, 0, len(c.pendingInvites))
+	for _, inv := range c.pendingInvites {
+		if strings.TrimSpace(inv.Group) == "" {
+			continue
+		}
+		inv.FromLabel = c.displayPeerLocked(inv.FromID)
+		inv.Channel = strings.TrimSpace(inv.Channel)
+		inv.InviteKey = channelInviteKey(inv.FromID, inv.Group)
+		out = append(out, inv)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ReceivedAt == out[j].ReceivedAt {
+			if out[i].Group == out[j].Group {
+				return out[i].Channel < out[j].Channel
+			}
+			return out[i].Group < out[j].Group
+		}
+		return out[i].ReceivedAt > out[j].ReceivedAt
+	})
 	return out
 }
 
@@ -958,7 +1298,12 @@ func (c *webClient) groupsList() []groupEntry {
 		}
 		sort.Strings(channels)
 		_, owned := c.ownedGroups[g]
-		out = append(out, groupEntry{Name: g, Channels: channels, Owned: owned})
+		ownerID := strings.TrimSpace(c.groupOwners[g])
+		ownerLabel := ""
+		if looksLikeLoginID(ownerID) {
+			ownerLabel = c.displayPeerLocked(ownerID)
+		}
+		out = append(out, groupEntry{Name: g, Channels: channels, Owned: owned, OwnerID: ownerID, OwnerLabel: ownerLabel})
 	}
 	return out
 }
@@ -1032,6 +1377,7 @@ func (c *webClient) handleBootstrap(w http.ResponseWriter, _ *http.Request) {
 		"profile_text":      c.profileText,
 		"targets":           c.dmTargets(),
 		"pending_friends":   c.pendingFriendRequests(),
+		"pending_invites":   c.pendingChannelInvites(),
 		"groups":            c.groupsList(),
 		"last_context":      c.lastContext,
 		"presence_visible":  c.presenceVisible,
@@ -1061,8 +1407,9 @@ func (c *webClient) handleEvents(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 	targets := c.dmTargets()
 	pending := c.pendingFriendRequests()
+	invites := c.pendingChannelInvites()
 	groups := c.groupsList()
-	writeJSON(w, http.StatusOK, map[string]any{"events": items, "targets": targets, "pending_friends": pending, "groups": groups})
+	writeJSON(w, http.StatusOK, map[string]any{"events": items, "targets": targets, "pending_friends": pending, "pending_invites": invites, "groups": groups})
 }
 
 func (c *webClient) handleSend(w http.ResponseWriter, r *http.Request) {
@@ -1112,6 +1459,23 @@ func normalizeChannelName(v string) string {
 	return v
 }
 
+func channelInviteKey(from string, group string) string {
+	return strings.TrimSpace(from) + "|" + normalizeGroupName(group)
+}
+
+func parseChannelInviteKey(v string) (from string, group string, ok bool) {
+	parts := strings.Split(strings.TrimSpace(v), "|")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	from = strings.TrimSpace(parts[0])
+	group = normalizeGroupName(parts[1])
+	if !looksLikeLoginID(from) || group == "" {
+		return "", "", false
+	}
+	return from, group, true
+}
+
 func (c *webClient) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Group   string `json:"group"`
@@ -1139,6 +1503,7 @@ func (c *webClient) handleGroupCreate(w http.ResponseWriter, r *http.Request) {
 	c.rememberGroup(group, channel)
 	c.mu.Lock()
 	c.ownedGroups[group] = struct{}{}
+	c.groupOwners[group] = c.loginID
 	c.mu.Unlock()
 	c.persistUIState()
 	c.addEvent("info", fmt.Sprintf("group created: %s/%s (%s)", group, channel, map[bool]string{true: "public", false: "private"}[public]))
@@ -1223,7 +1588,6 @@ func (c *webClient) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	group := normalizeGroupName(req.Group)
-	channel := normalizeChannelName(req.Channel)
 	if group == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group required"})
 		return
@@ -1238,7 +1602,7 @@ func (c *webClient) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		if err := c.sendSigned(Packet{Type: "channel_invite", To: target, Group: group, Channel: channel}); err != nil {
+		if err := c.sendSigned(Packet{Type: "group_invite", To: target, Group: group, Channel: ""}); err != nil {
 			continue
 		}
 		sent++
@@ -1247,9 +1611,87 @@ func (c *webClient) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no valid recipients"})
 		return
 	}
-	c.rememberGroup(group, channel)
-	c.addEvent("info", fmt.Sprintf("group invite sent: %s/%s recipients=%d", group, channel, sent))
+	c.rememberGroup(group, "default")
+	c.addEvent("info", fmt.Sprintf("group invite sent: %s recipients=%d", group, sent))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "sent": sent})
+}
+
+func (c *webClient) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InviteKey string `json:"invite_key"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	from, group, ok := parseChannelInviteKey(req.InviteKey)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid invite key"})
+		return
+	}
+	c.mu.Lock()
+	_, exists := c.pendingInvites[channelInviteKey(from, group)]
+	c.mu.Unlock()
+	if !exists {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invite no longer pending"})
+		return
+	}
+	channel := "default"
+	if err := c.sendSigned(Packet{Type: "channel_join", Group: group, Channel: channel}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.mu.Lock()
+	delete(c.pendingInvites, channelInviteKey(from, group))
+	c.mu.Unlock()
+	c.rememberGroup(group, channel)
+	c.addEvent("info", fmt.Sprintf("group invite accepted: %s", group))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group, "channel": channel})
+}
+
+func (c *webClient) handleInviteIgnore(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InviteKey string `json:"invite_key"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	from, group, ok := parseChannelInviteKey(req.InviteKey)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid invite key"})
+		return
+	}
+	c.mu.Lock()
+	delete(c.pendingInvites, channelInviteKey(from, group))
+	c.mu.Unlock()
+	// Ignore is local-only: dismiss the notice without server action.
+	c.addEvent("info", fmt.Sprintf("group invite ignored: %s", group))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (c *webClient) handleInviteReject(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InviteKey string `json:"invite_key"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	from, group, ok := parseChannelInviteKey(req.InviteKey)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid invite key"})
+		return
+	}
+	if err := c.sendSigned(Packet{Type: "group_invite_reject", To: from, Group: group, Channel: ""}); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.mu.Lock()
+	delete(c.pendingInvites, channelInviteKey(from, group))
+	c.mu.Unlock()
+	c.addEvent("info", fmt.Sprintf("group invite rejected: %s", group))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (c *webClient) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -1346,6 +1788,59 @@ func (c *webClient) handleFriendIgnore(w http.ResponseWriter, r *http.Request) {
 	c.mu.Unlock()
 	c.addEvent("info", "friend request ignored: "+c.displayPeer(target))
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (c *webClient) rotateE2EEKey() (int, error) {
+	priv, pubB64, err := netsec.NewX25519Identity()
+	if err != nil {
+		return 0, err
+	}
+	c.mu.Lock()
+	e2eePath := strings.TrimSpace(c.e2eePath)
+	c.mu.Unlock()
+	if e2eePath == "" {
+		return 0, fmt.Errorf("missing e2ee key path")
+	}
+	payload, err := json.MarshalIndent(e2eeKeyFile{PrivateKey: base64.StdEncoding.EncodeToString(priv.Bytes())}, "", "  ")
+	if err != nil {
+		return 0, err
+	}
+	if err := writeFileAtomic(e2eePath, payload, 0o600); err != nil {
+		return 0, err
+	}
+
+	c.mu.Lock()
+	c.e2ee = priv
+	c.e2eeB64 = pubB64
+	friendIDs := make([]string, 0, len(c.friends))
+	for id := range c.friends {
+		if looksLikeLoginID(id) && id != c.loginID {
+			friendIDs = append(friendIDs, id)
+		}
+	}
+	c.mu.Unlock()
+
+	shared := 0
+	for _, id := range friendIDs {
+		if err := c.sendSigned(Packet{Type: "friend_add", To: id, Body: c.friendKeyBody()}); err == nil {
+			shared++
+		}
+	}
+	return shared, nil
+}
+
+func (c *webClient) handleE2EERotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	shared, err := c.rotateE2EEKey()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	c.addEvent("info", fmt.Sprintf("e2ee key rotated; shared with %d friends", shared))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "shared_with": shared})
 }
 
 func (c *webClient) handleProfileSet(w http.ResponseWriter, r *http.Request) {
@@ -1463,7 +1958,7 @@ func (c *webClient) handlePresenceSet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *webClient) handleTargets(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"targets": c.dmTargets(), "pending_friends": c.pendingFriendRequests()})
+	writeJSON(w, http.StatusOK, map[string]any{"targets": c.dmTargets(), "pending_friends": c.pendingFriendRequests(), "pending_invites": c.pendingChannelInvites()})
 }
 
 func (c *webClient) handleGroups(w http.ResponseWriter, _ *http.Request) {
@@ -1854,6 +2349,10 @@ func e2eePathForKey(home string, keyPath string) string {
 	return filepath.Join(home, ".goaccord", "e2ee", "e2ee-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
 }
 
+func e2eeStatePathForKey(home string, keyPath string) string {
+	return filepath.Join(home, ".goaccord", "e2ee", "e2ee-state-"+filepath.Base(strings.TrimSpace(keyPath))+".json")
+}
+
 func loadOrCreateE2EEKey(path string) (*ecdh.PrivateKey, string, error) {
 	if data, err := os.ReadFile(path); err == nil {
 		var kf e2eeKeyFile
@@ -1881,6 +2380,100 @@ func loadOrCreateE2EEKey(path string) (*ecdh.PrivateKey, string, error) {
 		return nil, "", err
 	}
 	return priv, pubB64, nil
+}
+
+func loadE2EEState(path string) (map[string][]string, map[string]map[string]int64, error) {
+	peerKeys := make(map[string][]string)
+	nonces := make(map[string]map[string]int64)
+	if strings.TrimSpace(path) == "" {
+		return peerKeys, nonces, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return peerKeys, nonces, nil
+		}
+		return nil, nil, err
+	}
+	var f e2eeStateFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, nil, err
+	}
+	for _, p := range f.PeerKeys {
+		id := strings.TrimSpace(p.LoginID)
+		pub := strings.TrimSpace(p.E2EEPub)
+		if looksLikeLoginID(id) && pub != "" {
+			_ = addPeerKeyWithLimit(peerKeys, id, pub, maxPeerKeysPerLogin)
+		}
+	}
+	for _, n := range f.Nonces {
+		id := strings.TrimSpace(n.LoginID)
+		nonce := strings.TrimSpace(n.Nonce)
+		if !looksLikeLoginID(id) || nonce == "" || n.TS <= 0 {
+			continue
+		}
+		if nonces[id] == nil {
+			nonces[id] = make(map[string]int64)
+		}
+		nonces[id][nonce] = n.TS
+	}
+	return peerKeys, nonces, nil
+}
+
+func saveE2EEState(path string, peerKeys map[string][]string, nonces map[string]map[string]int64) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	ids := make([]string, 0, len(peerKeys))
+	for id := range peerKeys {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := e2eeStateFile{
+		PeerKeys: make([]savedPeerE2EE, 0, len(ids)),
+	}
+	for _, id := range ids {
+		if !looksLikeLoginID(id) {
+			continue
+		}
+		for _, key := range peerKeys[id] {
+			pub := strings.TrimSpace(key)
+			if pub == "" {
+				continue
+			}
+			out.PeerKeys = append(out.PeerKeys, savedPeerE2EE{LoginID: id, E2EEPub: pub, SeenAt: time.Now().Unix()})
+		}
+	}
+	nonceRows := make([]savedFriendNonce, 0)
+	nonceIDs := make([]string, 0, len(nonces))
+	for id := range nonces {
+		nonceIDs = append(nonceIDs, id)
+	}
+	sort.Strings(nonceIDs)
+	for _, id := range nonceIDs {
+		byNonce := nonces[id]
+		if !looksLikeLoginID(id) || len(byNonce) == 0 {
+			continue
+		}
+		keys := make([]string, 0, len(byNonce))
+		for nonce := range byNonce {
+			keys = append(keys, nonce)
+		}
+		sort.Strings(keys)
+		for _, nonce := range keys {
+			ts := byNonce[nonce]
+			if strings.TrimSpace(nonce) == "" || ts <= 0 {
+				continue
+			}
+			nonceRows = append(nonceRows, savedFriendNonce{LoginID: id, Nonce: nonce, TS: ts})
+		}
+	}
+	out.Nonces = nonceRows
+	payload, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, payload, 0o600)
 }
 
 func signAction(priv ed25519.PrivateKey, p Packet) (string, error) {
@@ -2161,9 +2754,14 @@ func main() {
 	}
 	*keyPath = selectedKeyPath
 	e2eePath := e2eePathForKey(home, *keyPath)
+	e2eeStatePath := e2eeStatePathForKey(home, *keyPath)
 	e2eePriv, e2eePubB64, err := loadOrCreateE2EEKey(e2eePath)
 	if err != nil {
 		log.Fatalf("e2ee key load failed: %v", err)
+	}
+	peerE2EEMulti, friendKeyNonces, err := loadE2EEState(e2eeStatePath)
+	if err != nil {
+		log.Fatalf("e2ee state load failed: %v", err)
 	}
 
 	contacts, err := loadContacts(*contactsPath)
@@ -2199,6 +2797,8 @@ func main() {
 		contactsPath:     *contactsPath,
 		profilePath:      *profilePath,
 		uiStatePath:      uiStatePath,
+		e2eePath:         e2eePath,
+		e2eeStatePath:    e2eeStatePath,
 		contacts:         contacts,
 		nicknames:        nicknames,
 		peerProfiles:     peerProfiles,
@@ -2209,12 +2809,16 @@ func main() {
 		presenceTTLSec:   defaultPresenceTTLSec,
 		friends:          make(map[string]struct{}),
 		pendingFriends:   make(map[string]int64),
+		pendingInvites:   make(map[string]channelInviteEntry),
 		groups:           make(map[string]map[string]struct{}),
 		ownedGroups:      make(map[string]struct{}),
+		groupOwners:      make(map[string]string),
 		lastContext:      savedCtx,
 		pendingPings:     make(map[string]int64),
 		seenChatIDs:      make(map[string]struct{}),
-		peerE2EE:         make(map[string]string),
+		peerE2EEMulti:    peerE2EEMulti,
+		friendKeyNonces:  friendKeyNonces,
+		e2eeIssues:       make(map[string]string),
 		serverAddr:       *serverAddr,
 	}
 	for _, g := range savedGroups {
@@ -2227,6 +2831,9 @@ func main() {
 			if g.Owned {
 				client.ownedGroups[group] = struct{}{}
 			}
+			if looksLikeLoginID(strings.TrimSpace(g.OwnerID)) {
+				client.groupOwners[group] = strings.TrimSpace(g.OwnerID)
+			}
 			continue
 		}
 		for _, ch := range g.Channels {
@@ -2234,6 +2841,9 @@ func main() {
 		}
 		if g.Owned {
 			client.ownedGroups[group] = struct{}{}
+		}
+		if looksLikeLoginID(strings.TrimSpace(g.OwnerID)) {
+			client.groupOwners[group] = strings.TrimSpace(g.OwnerID)
 		}
 	}
 	client.addEvent("info", "connected to "+*serverAddr)
@@ -2284,6 +2894,10 @@ func main() {
 	mux.HandleFunc("/api/friend/add", client.handleFriendAdd)
 	mux.HandleFunc("/api/friend/accept", client.handleFriendAccept)
 	mux.HandleFunc("/api/friend/ignore", client.handleFriendIgnore)
+	mux.HandleFunc("/api/invite/accept", client.handleInviteAccept)
+	mux.HandleFunc("/api/invite/ignore", client.handleInviteIgnore)
+	mux.HandleFunc("/api/invite/reject", client.handleInviteReject)
+	mux.HandleFunc("/api/e2ee/rotate", client.handleE2EERotate)
 	mux.HandleFunc("/api/profile/set", client.handleProfileSet)
 	mux.HandleFunc("/api/profile/get", client.handleProfileGet)
 	mux.HandleFunc("/api/presence/check", client.handlePresenceCheck)
