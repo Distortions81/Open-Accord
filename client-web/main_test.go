@@ -113,3 +113,74 @@ func TestAddPeerKeyWithLimitCapsAndMovesToFront(t *testing.T) {
 		t.Fatalf("expected existing key moved to front: %#v", m[loginID])
 	}
 }
+
+func TestParseFriendKeyRejectsIdentityMismatch(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen failed: %v", err)
+	}
+	body := buildSignedFriendKeyBody(t, priv, "test-e2ee-pub", time.Now().UnixMilli(), "nonce-mismatch")
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("other keygen failed: %v", err)
+	}
+
+	_, present, err := parseFriendKey(body, loginIDForPubKey(otherPub))
+	if !present {
+		t.Fatalf("expected payload to be present")
+	}
+	if err == nil {
+		t.Fatalf("expected identity mismatch error")
+	}
+}
+
+func TestParseFriendKeyRejectsTooFarFutureTimestamp(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen failed: %v", err)
+	}
+	from := loginIDForPubKey(pub)
+	body := buildSignedFriendKeyBody(t, priv, "test-e2ee-pub", time.Now().Add(6*time.Minute).UnixMilli(), "nonce-future")
+
+	_, present, err := parseFriendKey(body, from)
+	if !present {
+		t.Fatalf("expected payload to be present")
+	}
+	if err == nil {
+		t.Fatalf("expected future timestamp rejection")
+	}
+}
+
+func TestParseFriendKeyRejectsOldTimestamp(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen failed: %v", err)
+	}
+	from := loginIDForPubKey(pub)
+	body := buildSignedFriendKeyBody(t, priv, "test-e2ee-pub", time.Now().Add(-friendKeyMaxAge-time.Minute).UnixMilli(), "nonce-old")
+
+	_, present, err := parseFriendKey(body, from)
+	if !present {
+		t.Fatalf("expected payload to be present")
+	}
+	if err == nil {
+		t.Fatalf("expected old timestamp rejection")
+	}
+}
+
+func TestParseFriendKeyRejectsIncompletePayload(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("keygen failed: %v", err)
+	}
+	from := loginIDForPubKey(pub)
+	body := `{"e2ee_pub":"abc"}`
+
+	_, present, err := parseFriendKey(body, from)
+	if !present {
+		t.Fatalf("expected payload to be present")
+	}
+	if err == nil {
+		t.Fatalf("expected incomplete payload rejection")
+	}
+}

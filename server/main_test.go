@@ -739,3 +739,131 @@ func TestMultipleSessionsSameLoginReceiveDelivery(t *testing.T) {
 		t.Fatalf("unexpected message body A=%+v B=%+v", msgA, msgB)
 	}
 }
+
+func TestPlaintextTCPConnectionRejected(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("plain dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte(`{"type":"hello","role":"user"}` + "\n")); err != nil {
+		t.Fatalf("plain write failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	var p Packet
+	err = json.NewDecoder(conn).Decode(&p)
+	if err == nil {
+		t.Fatalf("expected plaintext connection to fail, got packet: %+v", p)
+	}
+}
+
+func TestAuthRejectsClaimedPubKeyMismatch(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	conn, err := tls.Dial("tcp", addr, netsec.ClientTLSConfigInsecure())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
+
+	pubA, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("key A generation failed: %v", err)
+	}
+	pubB, privB, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("key B generation failed: %v", err)
+	}
+
+	if err := enc.Encode(Packet{Type: "hello", Role: "user", PubKey: base64.StdEncoding.EncodeToString(pubA)}); err != nil {
+		t.Fatalf("hello send failed: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	var challenge Packet
+	if err := dec.Decode(&challenge); err != nil {
+		t.Fatalf("challenge read failed: %v", err)
+	}
+	if challenge.Type != "challenge" || challenge.Nonce == "" {
+		t.Fatalf("unexpected challenge: %+v", challenge)
+	}
+
+	loginSig := ed25519.Sign(privB, []byte("login:"+challenge.Nonce))
+	if err := enc.Encode(Packet{
+		Type:   "auth",
+		PubKey: base64.StdEncoding.EncodeToString(pubB),
+		Sig:    base64.StdEncoding.EncodeToString(loginSig),
+	}); err != nil {
+		t.Fatalf("auth send failed: %v", err)
+	}
+
+	var resp Packet
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("auth response read failed: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Fatalf("expected error response, got %+v", resp)
+	}
+	if !strings.Contains(resp.Body, "pubkey mismatch") {
+		t.Fatalf("unexpected auth error: %+v", resp)
+	}
+}
+
+func TestPeerHelloRejectsInvalidIdentityProof(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addr, _, stop := startTestServer(t, "s1", "", nil, cfg)
+	defer stop()
+
+	conn, err := tls.Dial("tcp", addr, netsec.ClientTLSConfigInsecure())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	enc := json.NewEncoder(conn)
+	dec := json.NewDecoder(conn)
+
+	ownerPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("owner key generation failed: %v", err)
+	}
+	peerID, err := composeServerID(loginIDForPubKey(ownerPub), "peer1")
+	if err != nil {
+		t.Fatalf("compose peer id failed: %v", err)
+	}
+
+	if err := enc.Encode(Packet{
+		Type:   "hello",
+		Role:   "server",
+		ID:     peerID,
+		PubKey: base64.StdEncoding.EncodeToString(ownerPub),
+		Sig:    base64.StdEncoding.EncodeToString([]byte("bad-proof")),
+	}); err != nil {
+		t.Fatalf("peer hello send failed: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	var resp Packet
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("peer response read failed: %v", err)
+	}
+	if resp.Type != "error" {
+		t.Fatalf("expected error, got %+v", resp)
+	}
+	if !strings.Contains(resp.Body, "invalid server identity proof") {
+		t.Fatalf("unexpected peer error: %+v", resp)
+	}
+}

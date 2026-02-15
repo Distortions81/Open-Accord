@@ -126,6 +126,8 @@ func main() {
 		e2eeIssues:      make(map[string]string),
 		groups:          make(map[string]map[string]struct{}),
 		pendingInvites:  make(map[string]pendingInvite),
+		dmUnread:        make(map[string]int),
+		channelUnread:   make(map[string]int),
 		lastContext:     savedCtx,
 		group:           strings.TrimSpace(*group),
 		channel:         strings.TrimSpace(*channel),

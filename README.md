@@ -128,7 +128,8 @@ Detailed docs:
 ## Protocol Notes
 
 Protocol is intentionally unversioned and pragmatic right now.
-Backward-compatible changes are favored (new optional fields, new ignorable packet types).
+Pre-beta policy: prefer clean breaks over backward-compatibility shims when protocol/message behavior changes.
+When behavior changes, update `PROTOCOL.md`, tests, and clients in lockstep.
 For exact behavior, `PROTOCOL.md` is authoritative for this repo state.
 
 ## Contributing

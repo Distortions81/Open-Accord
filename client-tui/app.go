@@ -247,6 +247,8 @@ type model struct {
 	e2eeIssues        map[string]string
 	groups            map[string]map[string]struct{}
 	pendingInvites    map[string]pendingInvite
+	dmUnread          map[string]int
+	channelUnread     map[string]int
 	lastContext       chatContext
 
 	infoEntries []string
@@ -479,6 +481,7 @@ func (m *model) applyFocus(t panelTarget) {
 		m.to = t.direct
 		m.group = ""
 		m.channel = ""
+		m.clearDMUnread(strings.TrimSpace(t.direct))
 	case panelChannel:
 		m.focusMode = panelChannel
 		m.focusDirect = ""
@@ -489,8 +492,112 @@ func (m *model) applyFocus(t panelTarget) {
 			m.channel = parts[1]
 		}
 		m.to = ""
+		m.clearChannelUnread(strings.TrimSpace(t.channel))
 	}
 	m.persistUIState()
+}
+
+func (m *model) currentGroupChannel() string {
+	group := strings.TrimSpace(m.group)
+	channel := strings.TrimSpace(m.channel)
+	if group == "" || channel == "" {
+		return ""
+	}
+	return group + "/" + channel
+}
+
+func (m *model) isDMContextVisible(target string) bool {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return false
+	}
+	switch m.focusMode {
+	case panelDirect:
+		return strings.TrimSpace(m.focusDirect) == target
+	case panelAll:
+		return m.currentGroupChannel() == "" && strings.TrimSpace(m.to) == target
+	default:
+		return false
+	}
+}
+
+func (m *model) isChannelContextVisible(groupChannel string) bool {
+	groupChannel = strings.TrimSpace(groupChannel)
+	if groupChannel == "" {
+		return false
+	}
+	switch m.focusMode {
+	case panelChannel:
+		return strings.TrimSpace(m.focusChannel) == groupChannel
+	case panelAll:
+		return m.currentGroupChannel() == groupChannel
+	default:
+		return false
+	}
+}
+
+func (m *model) addDMUnread(target string) {
+	target = strings.TrimSpace(target)
+	if !looksLikeLoginID(target) {
+		return
+	}
+	if m.dmUnread == nil {
+		m.dmUnread = make(map[string]int)
+	}
+	m.dmUnread[target]++
+}
+
+func (m *model) clearDMUnread(target string) {
+	target = strings.TrimSpace(target)
+	if target == "" || m.dmUnread == nil {
+		return
+	}
+	delete(m.dmUnread, target)
+}
+
+func (m *model) addChannelUnread(groupChannel string) {
+	groupChannel = strings.TrimSpace(groupChannel)
+	if groupChannel == "" {
+		return
+	}
+	if m.channelUnread == nil {
+		m.channelUnread = make(map[string]int)
+	}
+	m.channelUnread[groupChannel]++
+}
+
+func (m *model) clearChannelUnread(groupChannel string) {
+	groupChannel = strings.TrimSpace(groupChannel)
+	if groupChannel == "" || m.channelUnread == nil {
+		return
+	}
+	delete(m.channelUnread, groupChannel)
+}
+
+func (m *model) serverUnreadCount(group string) int {
+	group = strings.TrimSpace(group)
+	if group == "" || m.channelUnread == nil {
+		return 0
+	}
+	total := 0
+	prefix := group + "/"
+	for ch, n := range m.channelUnread {
+		if strings.HasPrefix(ch, prefix) {
+			total += n
+		}
+	}
+	return total
+}
+
+func (m *model) totalUnread() int {
+	total := 0
+	for _, n := range m.dmUnread {
+		total += n
+	}
+	for _, n := range m.channelUnread {
+		total += n
+	}
+	return total
 }
 
 func (m *model) shouldShow(e uiEntry) bool {
@@ -795,6 +902,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				directCtx = other
 			}
 			m.addChatEntry(m.displayPeer(msg.pkt.From), line, directCtx, channelCtx)
+			if msg.pkt.From != m.loginID {
+				if msg.pkt.Type == "deliver" && directCtx != "" && !m.isDMContextVisible(directCtx) {
+					m.addDMUnread(directCtx)
+				}
+				if msg.pkt.Type == "channel_deliver" && channelCtx != "" && !m.isChannelContextVisible(channelCtx) {
+					m.addChannelUnread(channelCtx)
+				}
+			}
 			return m, waitNet(m.events)
 		case "ping":
 			if looksLikeLoginID(msg.pkt.From) {
@@ -990,7 +1105,7 @@ func (m model) View() string {
 	}
 
 	header := headerStyle.Render("goAccord TUI") + "  " +
-		statusStyle.Render("panel="+panelLabel+" login="+m.displayPeer(m.loginID)+" to="+emptyDash(m.displayPeer(m.to))+" group="+emptyDash(m.group)+" channel="+emptyDash(m.channel)+fmt.Sprintf(" contacts=%d friends=%d invites=%d", len(m.contacts), len(m.friends), len(m.pendingInvites)))
+		statusStyle.Render("panel="+panelLabel+" login="+m.displayPeer(m.loginID)+" to="+emptyDash(m.displayPeer(m.to))+" group="+emptyDash(m.group)+" channel="+emptyDash(m.channel)+fmt.Sprintf(" contacts=%d friends=%d invites=%d unread=%d", len(m.contacts), len(m.friends), len(m.pendingInvites), m.totalUnread()))
 
 	if m.width > 0 {
 		m.input.Width = maxInt(10, m.width-4)
@@ -1078,7 +1193,7 @@ func (m *model) buildPanelChoices() (string, map[int]panelTarget) {
 	lines := make([]string, 0)
 	idx := 0
 	choices[idx] = panelTarget{mode: panelAll}
-	lines = append(lines, fmt.Sprintf("%d) all", idx))
+	lines = append(lines, fmt.Sprintf("%d) all (unread:%d)", idx, m.totalUnread()))
 	idx++
 
 	directSet := make(map[string]struct{})
@@ -1102,7 +1217,12 @@ func (m *model) buildPanelChoices() (string, map[int]panelTarget) {
 	sort.Strings(directs)
 	for _, id := range directs {
 		choices[idx] = panelTarget{mode: panelDirect, direct: id}
-		lines = append(lines, fmt.Sprintf("%d) direct %s", idx, m.displayPeer(id)))
+		unread := m.dmUnread[id]
+		suffix := ""
+		if unread > 0 {
+			suffix = fmt.Sprintf(" (unread:%d)", unread)
+		}
+		lines = append(lines, fmt.Sprintf("%d) direct %s%s", idx, m.displayPeer(id), suffix))
 		idx++
 	}
 
@@ -1127,7 +1247,12 @@ func (m *model) buildPanelChoices() (string, map[int]panelTarget) {
 	sort.Strings(channels)
 	for _, ch := range channels {
 		choices[idx] = panelTarget{mode: panelChannel, channel: ch}
-		lines = append(lines, fmt.Sprintf("%d) channel %s", idx, ch))
+		unread := m.channelUnread[ch]
+		suffix := ""
+		if unread > 0 {
+			suffix = fmt.Sprintf(" (unread:%d)", unread)
+		}
+		lines = append(lines, fmt.Sprintf("%d) channel %s%s", idx, ch, suffix))
 		idx++
 	}
 	m.panelChoices = choices
@@ -1216,7 +1341,12 @@ func (m *model) formatDMList() string {
 	}
 	lines := []string{"dm targets:"}
 	for i, id := range ids {
-		lines = append(lines, fmt.Sprintf("  %d) %s (%s) %s", i+1, m.displayPeer(id), id, m.presenceSummary(id)))
+		unread := m.dmUnread[id]
+		unreadLabel := ""
+		if unread > 0 {
+			unreadLabel = fmt.Sprintf(" unread=%d", unread)
+		}
+		lines = append(lines, fmt.Sprintf("  %d) %s (%s) %s%s", i+1, m.displayPeer(id), id, m.presenceSummary(id), unreadLabel))
 	}
 	lines = append(lines, "use /dm <index|name|login_id>")
 	return strings.Join(lines, "\n")
@@ -1259,7 +1389,22 @@ func (m *model) formatServers() string {
 			chs = append(chs, ch)
 		}
 		sort.Strings(chs)
-		lines = append(lines, "  "+g+": "+strings.Join(chs, ", "))
+		channelLabels := make([]string, 0, len(chs))
+		for _, ch := range chs {
+			key := groupChannelKey(g, ch)
+			unread := m.channelUnread[key]
+			if unread > 0 {
+				channelLabels = append(channelLabels, fmt.Sprintf("%s[%d]", ch, unread))
+			} else {
+				channelLabels = append(channelLabels, ch)
+			}
+		}
+		groupUnread := m.serverUnreadCount(g)
+		groupLabel := g
+		if groupUnread > 0 {
+			groupLabel = fmt.Sprintf("%s[%d]", g, groupUnread)
+		}
+		lines = append(lines, "  "+groupLabel+": "+strings.Join(channelLabels, ", "))
 	}
 	return strings.Join(lines, "\n")
 }

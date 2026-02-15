@@ -11,10 +11,8 @@ Transport:
 
 ## Compatibility Policy
 - Protocol is currently unversioned at packet level.
-- Backward-compatible changes:
-  - adding optional fields
-  - adding new packet types that old nodes can ignore
-- Breaking changes require coordinated updates to this document and code.
+- Prototype/pre-beta policy: prefer clean breaks over legacy/backward-compatibility shims.
+- Protocol/message changes should be rolled out as coordinated updates to this document, server, and clients.
 
 ## Identity Primitives
 - User identity:
