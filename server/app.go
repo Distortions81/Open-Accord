@@ -49,6 +49,7 @@ const (
 	compressionZlib             = "zlib"
 	minPresenceTTLSec           = 180
 	maxPresenceTTLSec           = 900
+	routeEntryTTL               = 10 * time.Minute
 )
 
 type Packet struct {
@@ -159,6 +160,11 @@ type ChannelState struct {
 	Invites map[string]string
 }
 
+type userRoute struct {
+	peerID string
+	seenAt time.Time
+}
+
 func newRateLimiter(msgsPerSec int, burst int) *rateLimiter {
 	r := float64(msgsPerSec)
 	b := float64(burst)
@@ -224,6 +230,7 @@ type Server struct {
 	channels     map[string]*ChannelState
 	profiles     map[string]profilePayload
 	presence     map[string]presenceState
+	routes       map[string]userRoute
 	startedAt    time.Time
 
 	counter atomic.Uint64
@@ -283,6 +290,7 @@ func NewServer(id, ownerPubKeyB64 string, ownerPriv ed25519.PrivateKey, advertis
 		channels:             make(map[string]*ChannelState),
 		profiles:             make(map[string]profilePayload),
 		presence:             make(map[string]presenceState),
+		routes:               make(map[string]userRoute),
 		startedAt:            time.Now(),
 	}
 }
@@ -1032,6 +1040,7 @@ func (s *Server) addUser(name string, c *Conn) {
 		s.users[name] = make(map[*Conn]struct{})
 	}
 	s.users[name][c] = struct{}{}
+	s.routes[name] = userRoute{peerID: "", seenAt: time.Now()}
 }
 
 func (s *Server) removeUser(name string, c *Conn) {
@@ -1043,6 +1052,18 @@ func (s *Server) removeUser(name string, c *Conn) {
 			delete(s.users, name)
 		}
 	}
+}
+
+func (s *Server) rememberUserRoute(loginID, peerID string) {
+	loginID = strings.TrimSpace(loginID)
+	peerID = strings.TrimSpace(peerID)
+	if loginID == "" || peerID == "" {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.routes[loginID] = userRoute{peerID: peerID, seenAt: now}
 }
 
 func (s *Server) addPeer(peerID, addr string, c *Conn, maxMsgBytes int, maxMsgsPerSec int, burst int, caps []string) bool {
@@ -1072,6 +1093,11 @@ func (s *Server) removePeer(peerID string, c *Conn) {
 	defer s.mu.Unlock()
 	if existing, ok := s.peers[peerID]; ok && existing.conn == c {
 		delete(s.peers, peerID)
+		for loginID, route := range s.routes {
+			if route.peerID == peerID {
+				delete(s.routes, loginID)
+			}
+		}
 	}
 }
 
@@ -1702,30 +1728,108 @@ func (s *Server) deliverPending(loginID string) {
 	}
 }
 
-func (s *Server) floodToPeers(exceptID string, p Packet) {
+func (s *Server) forwardToPeers(exceptID string, p Packet) {
 	raw, _ := json.Marshal(p)
 	type target struct {
 		id          string
 		conn        *Conn
 		maxMsgBytes int
-		canRelay    bool
 	}
 
-	s.mu.RLock()
-	targets := make([]target, 0, len(s.peers))
+	s.mu.Lock()
+	relayPeers := make(map[string]target, len(s.peers))
 	for peerID, peer := range s.peers {
 		if peerID == exceptID {
 			continue
 		}
 		_, canRelay := peer.caps["relay"]
-		targets = append(targets, target{id: peerID, conn: peer.conn, maxMsgBytes: peer.maxMsgBytes, canRelay: canRelay})
-	}
-	s.mu.RUnlock()
-
-	for _, t := range targets {
-		if !t.canRelay {
+		if !canRelay {
 			continue
 		}
+		relayPeers[peerID] = target{id: peerID, conn: peer.conn, maxMsgBytes: peer.maxMsgBytes}
+	}
+	targetIDs := make(map[string]struct{}, len(relayPeers))
+	shouldFlood := false
+	addFloodTargets := func() {
+		for peerID := range relayPeers {
+			targetIDs[peerID] = struct{}{}
+		}
+	}
+
+	switch {
+	case p.Type == "channel_send":
+		key := channelKey(p.Group, p.Channel)
+		ch := s.channels[key]
+		if ch == nil {
+			shouldFlood = true
+			break
+		}
+		unknownRoute := false
+		hasRemoteMembers := false
+		now := time.Now()
+		for member := range ch.Members {
+			if len(s.users[member]) > 0 {
+				continue
+			}
+			hasRemoteMembers = true
+			route, ok := s.routes[member]
+			if !ok {
+				unknownRoute = true
+				continue
+			}
+			if now.Sub(route.seenAt) > routeEntryTTL {
+				delete(s.routes, member)
+				unknownRoute = true
+				continue
+			}
+			if route.peerID == "" || route.peerID == exceptID {
+				continue
+			}
+			if _, ok := relayPeers[route.peerID]; ok {
+				targetIDs[route.peerID] = struct{}{}
+				continue
+			}
+			unknownRoute = true
+		}
+		if hasRemoteMembers && (unknownRoute || len(targetIDs) == 0) {
+			shouldFlood = true
+		}
+	case strings.TrimSpace(p.To) != "":
+		if len(s.users[p.To]) > 0 {
+			break
+		}
+		route, ok := s.routes[p.To]
+		if !ok {
+			shouldFlood = true
+			break
+		}
+		if time.Since(route.seenAt) > routeEntryTTL {
+			delete(s.routes, p.To)
+			shouldFlood = true
+			break
+		}
+		if route.peerID == "" || route.peerID == exceptID {
+			break
+		}
+		if _, ok := relayPeers[route.peerID]; ok {
+			targetIDs[route.peerID] = struct{}{}
+			break
+		}
+		shouldFlood = true
+	default:
+		shouldFlood = true
+	}
+
+	if shouldFlood {
+		addFloodTargets()
+	}
+	targets := make([]target, 0, len(targetIDs))
+	for peerID := range targetIDs {
+		targets = append(targets, relayPeers[peerID])
+	}
+	s.mu.Unlock()
+
+	for _, t := range targets {
 		if t.maxMsgBytes > 0 && len(raw) > t.maxMsgBytes {
 			continue
 		}
@@ -1836,7 +1940,7 @@ func (s *Server) handleUserPacket(sender string, p Packet) {
 	stamped := s.withHop(local)
 	s.processSignedAction(stamped)
 	if s.relayEnabled {
-		s.floodToPeers("", s.withHop(p))
+		s.forwardToPeers("", s.withHop(p))
 	}
 }
 
@@ -1911,6 +2015,7 @@ func (s *Server) handlePeerPacket(fromPeer, peerAddr string, c *Conn, p Packet) 
 			}
 			return true
 		}
+		s.rememberUserRoute(p.From, fromPeer)
 		if !s.markSeen(p.ID) {
 			return true
 		}
@@ -1930,7 +2035,7 @@ func (s *Server) handlePeerPacket(fromPeer, peerAddr string, c *Conn, p Packet) 
 		stamped := s.withHop(local)
 		s.processSignedAction(stamped)
 		if s.relayEnabled {
-			s.floodToPeers(fromPeer, s.withHop(p))
+			s.forwardToPeers(fromPeer, s.withHop(p))
 		}
 		return true
 	}

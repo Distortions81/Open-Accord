@@ -231,6 +231,10 @@ Channel key is `(group, channel)`.
 ## Relay Rules
 - Nodes relay signed action packets when local relay is enabled.
 - Nodes relay only to peers advertising `relay` capability.
+- Relay is destination-aware when route knowledge exists:
+  - direct addressed actions (for example `send`) prefer a learned next-hop peer for `to`.
+  - `channel_send` prefers peers that are known routes for non-local channel members.
+- When route knowledge is missing/stale, nodes fall back to bounded flood-to-relay-peers.
 - Dedupe cache (`id`) prevents loops.
 
 ## Transport TLS

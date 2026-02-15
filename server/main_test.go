@@ -374,6 +374,49 @@ func TestMessageRelayAcrossPeers(t *testing.T) {
 	}
 }
 
+func TestRelayTargetsKnownDMRoute(t *testing.T) {
+	cfg := defaultTestServerConfig()
+	addrA, srvA, stopA := startTestServer(t, "s1", "", nil, cfg)
+	defer stopA()
+	addrB, _, stopB := startTestServer(t, "s1", "", nil, cfg)
+	defer stopB()
+	addrC, _, stopC := startTestServer(t, "s1", "", nil, cfg)
+	defer stopC()
+
+	srvA.addKnownAddr(addrB)
+	srvA.addKnownAddr(addrC)
+	go srvA.dialPeer(addrB)
+	go srvA.dialPeer(addrC)
+	waitForPeerCount(t, srvA, 2, 2*time.Second)
+
+	alice := newTestClient(t, addrA)
+	defer alice.close()
+
+	_, bobPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("bob key generation failed: %v", err)
+	}
+	bobOnB := newTestClientWithKey(t, addrB, bobPriv)
+	defer bobOnB.close()
+	bobOnC := newTestClientWithKey(t, addrC, bobPriv)
+	defer bobOnC.close()
+
+	bobOnB.send(t, alice.loginID, "prime-route")
+	prime := alice.recv(t, 2*time.Second)
+	if prime.Type != "deliver" {
+		t.Fatalf("expected prime deliver, got %+v", prime)
+	}
+
+	alice.send(t, bobOnB.loginID, "only-b")
+	onB := bobOnB.recv(t, 2*time.Second)
+	if onB.Type != "deliver" || onB.Body != "only-b" {
+		t.Fatalf("expected targeted deliver on route peer, got %+v", onB)
+	}
+	if p, err := bobOnC.recvMaybe(500 * time.Millisecond); err == nil {
+		t.Fatalf("non-target peer session should not receive routed dm, got %+v", p)
+	}
+}
+
 func TestOversizedPacketDropped(t *testing.T) {
 	cfg := defaultTestServerConfig()
 	cfg.maxMessageBytes = 512

@@ -71,6 +71,10 @@ Phase: Live-only mesh by default, with optional persistence mode.
 
 ## Routing Model
 - Servers relay signed actions (messages, friend actions, channel actions) across peers.
+- Current relay prefers destination-aware forwarding:
+  - direct addressed actions prefer learned next-hop routes for `to`.
+  - channel sends prefer peers that route to known non-local members.
+  - unknown/stale routes fall back to flood across relay-capable peers.
 - Message IDs are deduped to prevent loops.
 - Delivery is best-effort to currently connected recipients.
 - In persistence mode, hosted offline recipients can receive store-and-forward replay.

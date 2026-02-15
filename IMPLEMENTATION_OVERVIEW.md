@@ -45,7 +45,7 @@ Transport/security:
 
 Current server supports:
 - User session management
-- Peer mesh relay across servers
+- Peer mesh relay across servers with route-aware forwarding (targeted next-hop when known, flood fallback when unknown)
 - Channel membership/invite enforcement
 - Presence snapshots
 - Optional SQLite persistence mode (hosted users + offline queue)
