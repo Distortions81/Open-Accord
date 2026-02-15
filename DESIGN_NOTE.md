@@ -8,6 +8,16 @@ Protocol reference: `PROTOCOL.md` is the wire-level implementation target for in
 Date: 2026-02-10
 Phase: Live-only mesh by default, with optional persistence mode.
 
+## Status Checklist
+- [x] Live-only default behavior is the default server mode. (Complete)
+- [x] Owner-scoped `server_id` is enforced in startup/handshake paths. (Complete)
+- [x] Groups/channels are explicit operations (`channel_create`, `group_invite`, `channel_join`, `channel_leave`, `channel_send`). (Complete)
+- [x] Baseline automated coverage exists for signed delivery, cross-server relay, persist replay, and server identity proof handshake. (Complete)
+- [ ] Channel role model (`owner/admin/moderator` ACLs). (Planned)
+- [ ] Persistence ack/replay cursor (`since_seq` or `since_time`). (Planned)
+- [ ] Persistence retention/TTL and compaction controls. (Planned)
+- [ ] Optional encrypted persistence blobs at rest. (Planned)
+
 ## Goals
 - Support user-to-user messaging across a network of servers.
 - Support user-created groups and channels.
@@ -162,17 +172,16 @@ Function: dedupe and loop prevention in relay paths.
 - JSON remains supported for compatibility and debugging.
 
 ## Deferred Persistence Extensions
-- Ack/replay sync (`since_seq` or `since_time`).
-- Retention/TTL policies and compaction.
-- Optional encrypted blobs at rest.
-- User-controlled persistence tiers for channels/groups.
+- [ ] Ack/replay sync (`since_seq` or `since_time`). (Planned)
+- [ ] Retention/TTL policies and compaction. (Planned)
+- [ ] Optional encrypted blobs at rest. (Planned)
+- [ ] User-controlled persistence tiers for channels/groups. (Planned)
 
 ## Immediate Implementation Priorities
-1. Keep live-only behavior as default.
-2. Keep owner-scoped `server_id` model in startup/handshake.
-3. Expand groups/channels beyond labels into explicit operations.
-4. Add/extend automated tests for:
-   - signed user-to-user delivery
-   - cross-server relay
-   - offline queue replay for hosted identities in persist mode
-   - server identity proof handshake
+- [x] Keep live-only behavior as default. (Complete)
+- [x] Keep owner-scoped `server_id` model in startup/handshake. (Complete)
+- [x] Expand groups/channels beyond labels into explicit operations. (Complete)
+- [x] Add/extend automated tests for signed user-to-user delivery. (Complete)
+- [x] Add/extend automated tests for cross-server relay. (Complete)
+- [x] Add/extend automated tests for offline queue replay in persist mode. (Complete)
+- [x] Add/extend automated tests for server identity proof handshake. (Complete)

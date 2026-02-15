@@ -14,6 +14,17 @@ Transport:
 - Prototype/pre-beta policy: prefer clean breaks over legacy/backward-compatibility shims.
 - Protocol/message changes should be rolled out as coordinated updates to this document, server, and clients.
 
+## Protocol Status Checklist
+- [x] User auth challenge flow (`hello` -> `challenge` -> `auth` -> `ok`). (Complete)
+- [x] Signed action verification + replay protection (`id` dedupe). (Complete)
+- [x] Explicit channel operations (`channel_create`, `group_invite`, `channel_join`, `channel_leave`, `channel_send`). (Complete)
+- [x] TLS-required transport for client and peer links. (Complete)
+- [x] Persist-mode offline replay for hosted direct deliveries. (Complete)
+- [ ] Explicit protocol version negotiation. (Planned)
+- [ ] Rich channel roles/ACLs. (Partial: invite/membership rules exist, but no owner/admin/moderator role model)
+- [ ] Ack/replay cursor protocol (`since_seq` / `since_time`). (Planned)
+- [ ] Capability-negotiated binary transport. (Planned)
+
 ## Identity Primitives
 - User identity:
   - `login_id = hex(sha256(pubkey_bytes))`
@@ -259,7 +270,7 @@ Note:
 - offline queue/replay currently targets direct-style delivery payloads.
 
 ## Planned Extensions
-- explicit protocol version negotiation
-- richer channel roles/ACLs
-- ack/replay cursor protocol (`since_seq` / `since_time`)
-- capability-negotiated binary transport
+- [ ] explicit protocol version negotiation. (Planned)
+- [ ] richer channel roles/ACLs. (Partial: limited invite/membership authorization exists today)
+- [ ] ack/replay cursor protocol (`since_seq` / `since_time`). (Planned)
+- [ ] capability-negotiated binary transport. (Planned)

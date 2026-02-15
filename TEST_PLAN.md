@@ -3,6 +3,15 @@
 Date: 2026-02-10
 Scope: manual validation of current mesh, TUI client, channels, friends, and persistence behavior.
 
+## Coverage Checklist
+- [x] Automated: signed client-to-client delivery. (Complete)
+- [x] Automated: cross-peer relay delivery. (Complete)
+- [x] Automated: persist-mode offline queue and replay. (Complete)
+- [x] Automated: server identity proof handshake checks. (Complete)
+- [x] Automated: TLS policy checks (plaintext rejection and TLS config behavior). (Complete)
+- [x] Automated: friend-key/E2EE payload validation and replay checks in clients. (Complete)
+- [ ] Manual: multi-peer operator runbook (`scripts/reboot-peers.sh`, `scripts/status-peers.sh`) on this change set. (Pending run)
+
 ## Preconditions
 - Build/test succeeds:
 ```bash
@@ -109,6 +118,6 @@ Expected: no repeated identity errors under normal run.
 
 ## Maintenance Rule
 On protocol/behavior changes:
-1. Update `PROTOCOL.md`.
-2. Update `TEST_PLAN.md`.
-3. Add/adjust automated tests.
+- [ ] Update `PROTOCOL.md`.
+- [ ] Update `TEST_PLAN.md`.
+- [ ] Add/adjust automated tests.

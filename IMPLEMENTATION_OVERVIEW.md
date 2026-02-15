@@ -4,6 +4,15 @@ Date: 2026-02-10
 
 This is a brief technical snapshot of the current system behavior and architecture.
 
+## Status Checklist
+- [x] Signed DM delivery and relay are implemented. (Complete)
+- [x] Persist mode offline queue + replay for hosted users is implemented. (Complete)
+- [x] TLS-required transport is implemented for client and peer connections. (Complete)
+- [x] Web UI has thread-scoped views and unread counters. (Complete)
+- [x] TUI has thread-scoped views and unread counters in list/panel output. (Complete)
+- [ ] Web/TUI interaction parity is exact. (Partial: behavior is close but interaction style still differs)
+- [ ] Persistence guarantees are uniform across all modes. (Partial: behavior differs between `live` and `persist`)
+
 ## 1) High-level architecture
 
 - `server/`: TCP JSON-line message server with user auth, signed action validation, relay, and optional persistence.
@@ -96,5 +105,5 @@ Persistence parity with web:
 ## 7) Known practical caveats
 
 - Some UX behavior still differs between web and TUI (interaction style), even when protocol features match.
-- Thread behavior and unread counters are implemented in web UI; TUI uses command/panel flows and is still evolving toward full UX parity.
+- Thread behavior and unread counters are implemented in both web and TUI, but UX interaction patterns still differ.
 - Persistence guarantees depend on server mode (`live` vs `persist`).
